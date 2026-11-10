@@ -21,6 +21,7 @@ index:
   include_vendor: false
   # Library paths indexed for declarations only (classes, methods, PHPDoc), even with vendor excluded.
   declaration_paths: [vendor/yiisoft]
+  # php: always; add pgsql to index .sql/.pgsql files (SQL inside PHP createCommand/findBySql works with php alone).
   languages: [php]
   # [] disables the Yii2 framework plugin.
   frameworks: [yii2]

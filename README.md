@@ -10,6 +10,7 @@ Code Atlas строит карту PHP/Yii2-проекта: какие клас�
 
 - Строит граф объявлений, наследования, вызовов, чтений, записей, переменных, параметров и ветвлений; сохраняет позиции и условия выполнения.
 - Выводит типы из PHP-кода, PHPDoc, возвратов функций и статически понятных механизмов Yii2. Различает установленную цель, аннотацию, кандидатов и неизвестную цель.
+- Извлекает raw SQL из `createCommand` / `findBySql` / `prepare` в PHP (`sql_site`, таблицы, `sql_reads`/`sql_writes`); при `languages: […, pgsql]` индексирует `.sql`/`.pgsql` (DDL schema/table/column/view/function/index).
 - Дополняет PHP-граф сведениями о компонентах Yii2, behaviors, magic properties, ActiveRecord/ActiveQuery, конфигурационных ключах, представлениях, URL, очередях и событиях — в пределах поддержанного статического разбора.
 - Предоставляет семь MCP-инструментов: поиск сущностей, контекст, структуру класса/метода, текстовый поиск, чтение строк, исправление знаний и пакет запросов.
 - Следит за изменениями файлов, выполняет инкрементальные обновления и показывает состояние индексации. Полный проход доступен вручную.
@@ -66,7 +67,7 @@ index:
 | `index.watch`, `index.exclude` | Каталоги анализа (`["."]`) и дополнительные исключения только для графа (пусто). |
 | `index.include_vendor` | `false`; `true` включает полный анализ vendor. |
 | `index.declaration_paths` | `[vendor/yiisoft]`: объявления библиотек доступны без анализа тел при выключенном полном vendor. |
-| `index.languages`, `index.frameworks` | `[php]`, `[yii2]`; `frameworks: []` отключает Yii2. |
+| `index.languages`, `index.frameworks` | `[php]`, `[yii2]`; добавьте `pgsql` для `.sql`/`.pgsql`; `frameworks: []` отключает Yii2. SQL внутри PHP разбирается и при одном только `php`. |
 | `index.php_version` | `"8.2"`; допустимы 5.6, 7.0–7.4, 8.0–8.5. Выбор версии не означает полного покрытия её синтаксиса. |
 | `index.max_file_bytes` | `2097152`: до 2 MiB на файл анализа. |
 | `index.max_analysis_bytes` | `67108864`: до 64 MiB суммарного текста за проход. |
@@ -221,7 +222,7 @@ cargo run --locked -- serve
 
 `plugins` работает без БД и конфигурации проекта. Остальным командам нужны `ATLAS_DATABASE_URL`, `ATLAS_PROJECT_ROOT`, оба токена и доступная БД. `migrate` применяет схему; `index` выполняет один полный проход; `serve` запускает HTTP и watcher. Миграции также применяются при старте `index`, `serve` и `stdio`.
 
-Плагины `php` и `yii2` зарегистрированы независимо. Новый язык реализует `LanguagePlugin`, фреймворк — `FrameworkPlugin`; регистрация находится в [src/plugins/mod.rs](src/plugins/mod.rs). Новый плагин требует сборки бинарника. Выбор уже встроенных плагинов задаётся в setup-файле. Полноценных анализаторов JavaScript, Go, Rust и Python пока нет; поиск URL в JS/HTML/Vue относится к Yii2-расширению.
+Плагины `php`, `pgsql` и `yii2` зарегистрированы независимо. Новый язык реализует `LanguagePlugin`, фреймворк — `FrameworkPlugin`; регистрация находится в [src/plugins/mod.rs](src/plugins/mod.rs). Новый плагин требует сборки бинарника. Выбор уже встроенных плагинов задаётся в setup-файле. Полноценных анализаторов JavaScript, Go, Rust и Python пока нет; поиск URL в JS/HTML/Vue относится к Yii2-расширению. Контракт и границы SQL — [docs/plugins.md](docs/plugins.md), проверки — [docs/testing-native-pgsql.md](docs/testing-native-pgsql.md).
 
 ## Проверки и текущие ограничения
 
@@ -256,7 +257,7 @@ PHP-парсер структурный и ограниченный; это не
 | `src/repository.rs`, `src/postgres.rs`, `migrations/` | Контракт хранения, память для тестов, PostgreSQL и схема. |
 | `src/config.rs`, `src/setup.rs`, `src/project.rs` | Настройки, области, отбор файлов и обнаружение изменений. |
 | `src/indexer.rs`, `src/analyzer/`, `src/parallel.rs` | Конвейер анализа, реестр плагинов, инкрементальная область и потоки. |
-| `src/plugins/php/`, `src/plugins/yii2/` | Анализ языка и дополнение знаниями фреймворка. |
+| `src/plugins/php/`, `src/plugins/pgsql/`, `src/plugins/yii2/` | PHP, SQL/pgsql (в т.ч. SQL-in-PHP) и дополнение Yii2. |
 | `src/http.rs`, `src/mcp_text.rs`, `src/grep_search.rs` | HTTP/MCP, компактная выдача, текстовый поиск и чтение. |
 | `src/progress.rs`, `src/diagnostics_log.rs` | Прогресс и диагностические логи. |
 | `web/` | Встроенный интерфейс и тесты его моделей. |

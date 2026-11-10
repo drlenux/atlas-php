@@ -13,7 +13,7 @@ This workspace contains a Rust Code Atlas service, native Rust PHP and Yii2 plug
 - `.agents/skills/`: generated Codex workflow skills after successful tool initialization.
 - `src/`: Rust domain, Service Layer, PostgreSQL, HTTP/MCP, ENV, watcher/indexer.
 - `src/analyzer/`: language-neutral LanguagePlugin/FrameworkPlugin contracts and registry.
-- `src/plugins/php/`: native PHP language analysis; `src/plugins/yii2/`: separate native framework enrichment. No analyzed-language runtime or project autoloader may be invoked.
+- `src/plugins/php/`: native PHP language analysis; `src/plugins/pgsql/`: SQL/pgsql DDL files and DML outline shared with SQL-in-PHP; `src/plugins/yii2/`: separate native framework enrichment. No analyzed-language runtime or project autoloader may be invoked.
 - `migrations/`: PostgreSQL schema; `web/`: shipped HTML/CSS/JS interface.
 - `tests/`: behavior, HTTP, Git, indexing and integration tests; `docs/testing-*.md`: TDD evidence.
 - `Dockerfile`, `docker/`: complete image and lifecycle; `docker-compose.yml` consumes ATLAS_IMAGE without building.
