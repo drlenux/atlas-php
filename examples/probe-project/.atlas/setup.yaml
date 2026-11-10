@@ -1,0 +1,6 @@
+# Probe project: analyze the Yii stub under vendor/ as project code.
+version: 1
+index:
+  include_vendor: true
+  languages: [php]
+  frameworks: [yii2]

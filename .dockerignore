@@ -1,0 +1,7 @@
+.git
+target
+artifacts
+.run
+.env
+.env.*
+WORKTREE_LOCATION.txt

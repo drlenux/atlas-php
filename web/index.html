@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Code Atlas — использование графа</title>
+  <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script type="module" src="/assets/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Code Atlas"><span class="brand-mark">a<span>·</span></span><span>CODE ATLAS<small>Контекст, который остаётся</small></span></a>
+    <span id="connection" class="connection"><span></span>Ожидание подключения</span>
+  </header>
+  <main>
+    <div class="page-heading"><div><p class="eyebrow">ОБЗОР ПРОЕКТА</p><h1>Пульс графа<span>.</span></h1><p class="lead">Как знания о коде попадают в контекст агента.</p></div><div class="heading-note"><span class="note-mark">↗</span>Каждая связь —<br>часть общей картины</div></div>
+    <form id="connect-form" class="access-bar">
+      <label for="token">Доступ разработчика</label>
+      <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Токен проверки" required>
+      <button class="button primary" type="submit">Подключиться <span>→</span></button>
+      <span class="access-note">Токен хранится только до закрытия страницы.</span>
+    </form>
+    <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+    <section id="indexing" class="card indexing-card" aria-labelledby="indexing-title">
+      <div class="indexing-heading"><div><p class="eyebrow">ИНДЕКСАЦИЯ ПРОЕКТА</p><h2 id="indexing-title">Ход индексации</h2></div><div class="indexing-actions"><span id="indexing-stage" class="muted"></span><button id="reindex" class="button secondary" type="button" disabled>Переиндексировать</button><button id="reset-atlas" class="button danger" type="button" disabled>Удалить граф</button></div></div>
+      <p id="indexing-count" class="indexing-count" role="status" aria-live="polite">Подключитесь, чтобы увидеть прогресс.</p>
+      <progress id="indexing-progress" max="100" aria-label="Прогресс текущего этапа индексации" hidden></progress>
+      <div class="indexing-timing"><span id="indexing-elapsed"></span><span id="indexing-workers"></span><span id="indexing-eta"></span></div>
+      <p id="indexing-path" class="indexing-path" hidden></p>
+      <p id="indexing-error" class="indexing-error" role="status" hidden></p>
+    </section>
+    <nav class="tabs" aria-label="Разделы">
+      <button class="tab active" data-panel="analytics" aria-selected="true">Использование графа</button>
+      <button class="tab" data-panel="reviews" aria-selected="false">Проверка исправлений <span id="pending-badge" class="badge">—</span></button>
+      <button class="tab" data-panel="explore" aria-selected="false">Исследовать код</button>
+    </nav>
+    <section id="panel-analytics" class="panel">
+      <div class="section-toolbar"><div><h2>Выдача контекста</h2><p>Считаем MCP <code>atlas_context</code>, <code>atlas_outline</code> и непустой <code>atlas_search</code>. Просмотр во вкладке «Исследовать код» не учитывается.</p></div><form id="period-form" class="period-form"><label>С <input id="date-from" type="date" required></label><label>По <input id="date-to" type="date" required></label><span class="utc">UTC</span><button type="submit" class="button secondary">Обновить</button></form></div>
+      <div class="metrics"><article class="metric"><p>Ответы с контекстом</p><strong id="metric-responses">—</strong><span>Успешные выдачи через MCP</span></article><article class="metric"><p>Уникальные вершины</p><strong id="metric-nodes">—</strong><span>Сущности в выданном контексте</span></article><article class="metric"><p>Уникальные связи</p><strong id="metric-edges">—</strong><span>Отношения между сущностями</span></article></div>
+      <article class="card timeline-card"><div class="card-heading"><div><p class="eyebrow">ДИНАМИКА</p><h3>Контекст во времени</h3></div><span id="period-label" class="muted">Выберите период</span></div><div id="timeline" class="timeline"><p class="empty">Подключитесь, чтобы увидеть статистику проекта.</p></div></article>
+      <article class="card"><div class="card-heading"><div><p class="eyebrow">ДЕТАЛИЗАЦИЯ</p><h3>Что попало в контекст</h3></div><div class="table-filters"><label class="sr-only" for="kind-filter">Тип элемента</label><select id="kind-filter"><option value="all">Все элементы</option><option value="node">Вершины</option><option value="edge">Связи</option></select><label class="sr-only" for="element-filter">Поиск элемента</label><input id="element-filter" placeholder="Имя, файл или связь…" type="search"></div></div><div class="table-wrap"><table><thead><tr><th>Элемент графа</th><th>Тип</th><th>Расположение / связь</th><th class="number">Выдачи</th></tr></thead><tbody id="elements"><tr><td colspan="4" class="empty">Статистика появится после подключения.</td></tr></tbody></table></div><div class="card-footer"><span id="element-count">0 элементов</span><span>Одна сущность учитывается один раз в одном ответе</span></div></article>
+      <p class="metric-explanation"><span>i</span>Выдача в контексте не доказывает, что агент использовал данные в решении. Фактическое использование без обратной связи неизвестно.</p>
+    </section>
+    <section id="panel-reviews" class="panel" hidden>
+      <div class="section-toolbar"><div><h2>Исправления агента</h2><p>Уровень 2 уже действует. Подтвердите сведения или отмените правку.</p></div><button id="refresh-reviews" class="button secondary">Обновить</button></div>
+      <div id="reviews" class="reviews"><div class="card empty">Подключитесь, чтобы проверить исправления.</div></div>
+      <div class="pagination"><button id="reviews-prev" class="button secondary" disabled>← Назад</button><span id="reviews-page" class="muted"></span><button id="reviews-next" class="button secondary" disabled>Далее →</button></div>
+    </section>
+    <section id="panel-explore" class="panel" hidden>
+      <div class="section-toolbar"><div><h2>Найти сущность</h2><p>Просмотр здесь не влияет на статистику MCP-выдач.</p></div></div>
+      <form id="search-form" class="search-form"><label class="sr-only" for="search-query">Имя или выражение</label><input id="search-query" type="search" placeholder="Метод, класс, поле или выражение — например dep_tax_control" required><label class="sr-only" for="search-kind">Вид сущности</label><select id="search-kind"></select><label class="symbol-toggle" title="Точное имя метода, класса или поля; без упоминаний в строках и выражениях"><input id="search-symbol" type="checkbox"> по символу</label><button class="button primary">Найти</button></form>
+      <div class="explore-grid"><div><p id="search-summary" class="search-summary" role="status" aria-live="polite"></p><div id="search-results" class="search-results"></div><button id="search-more" class="button secondary search-more" type="button" hidden>Показать ещё</button></div><article class="card context-card" aria-live="polite"><div id="context-output" class="context-output"><h3>Контекст сущности</h3><p class="empty">Выберите результат поиска.</p></div></article></div>
+    </section>
+    <footer><span>Code Atlas</span><span>Структура кода · Контекст · Доверие</span></footer>
+  </main>
+</body>
+</html>

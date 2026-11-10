@@ -1,0 +1,9 @@
+# Publisher-only build recipe. No runtime credentials or inspected project required.
+# docker compose -f docker-compose.build.yml build atlas
+# docker compose -f docker-compose.build.yml push atlas
+services:
+  atlas:
+    image: ${ATLAS_IMAGE:-drlenux/memory-tools:0.1.31}
+    build:
+      context: .
+      dockerfile: Dockerfile

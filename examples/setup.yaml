@@ -1,0 +1,64 @@
+# Code Atlas project settings: copy to <project>/.atlas/setup.yaml.
+# Read at startup (restart the atlas service after a change). Every key is optional;
+# omitted keys keep the defaults shown here. Unknown keys stop the start with an error.
+# Secrets, CPU/memory limits and deployment wiring stay in the environment (docker-compose).
+version: 1
+
+# Never indexed, searched (atlas_grep, withGrep) or read (atlas_read).
+# .git, .idea, .vscode, node_modules, .atlas and .env files are always skipped.
+# Patterns: path prefixes, "*" (may cross "/"), "?"; a pattern without "/" also matches file names.
+exclude:
+  - runtime
+  - "*/web/assets"
+
+index:
+  # Directories (relative to the project root) watched and analyzed.
+  watch: ["."]
+  # Left out of the graph only; text search still sees them.
+  exclude:
+    - "*-local.php"
+  # true: analyze vendor/ fully (slow on large projects).
+  include_vendor: false
+  # Library paths indexed for declarations only (classes, methods, PHPDoc), even with vendor excluded.
+  declaration_paths: [vendor/yiisoft]
+  languages: [php]
+  # [] disables the Yii2 framework plugin.
+  frameworks: [yii2]
+  # Analyzed PHP version: 5.6, 7.0–7.4, 8.0–8.5.
+  php_version: "8.2"
+  max_file_bytes: 2097152          # largest analyzed source file
+  max_analysis_bytes: 67108864     # total source text of one pass
+  max_graph_elements: 2000000      # nodes + edges + diagnostics
+  analysis_timeout_secs: 120
+  debounce_ms: 5000                # wait after the last file change before reindexing
+  poll_ms: 1000                    # file watcher period
+
+grep:
+  # Left out of text search only; the graph still indexes them.
+  exclude:
+    - "*/tests/_output/*"
+  max_file_bytes: 16777216         # larger text files are reported as skipped
+
+tests:
+  # Test code left out of agent search, callers trees and called_by unless include_tests.
+  paths: ["tests/*", "*/tests/*", "*Test.php", "*Cest.php"]
+
+mcp:
+  max_context_nodes: 100
+  max_context_depth: 3
+  max_request_bytes: 1048576
+
+# Applications by folder. The prefix:
+# - labels every entity of the folder ([partner] in results) and is the `area` filter of
+#   atlas_search / atlas_grep / atlas_outline / atlas_context;
+# - gives Yii code its own application's components (Yii::$app->x from the area's configs,
+#   shared areas and configs outside every area);
+# - names namespace-less classes/functions of the folder `<prefix>:<Name>`, so same-named
+#   classes of different applications stay apart.
+# shared: true marks code used by every application (e.g. common).
+areas:
+  frontend: { paths: [frontend] }
+  backend: { paths: [backend] }
+  console: { paths: [console] }
+  common: { paths: [common], shared: true }
+

@@ -1,0 +1,33 @@
+services:
+  atlas:
+    image: ${ATLAS_IMAGE:-drlenux/memory-tools:probe-local}
+    restart: "no"
+    environment:
+      POSTGRES_DB: atlas
+      POSTGRES_USER: atlas
+      POSTGRES_PASSWORD: probe-pass
+      PGDATABASE: atlas
+      PGUSER: atlas
+      PGPASSWORD: probe-pass
+      ATLAS_PROJECT_ROOT: /project
+      ATLAS_BIND: 0.0.0.0:8080
+      ATLAS_DATABASE_URL: host=127.0.0.1 connect_timeout=5
+      ATLAS_AGENT_TOKEN: probe-agent
+      ATLAS_REVIEW_TOKEN: probe-reviewer
+      ATLAS_ALLOWED_ORIGINS: '["http://localhost:18085","http://127.0.0.1:18085"]'
+      ATLAS_CPU_LIMIT: "2"
+      ATLAS_INDEX_WORKERS: "4"
+      ATLAS_MEMORY_LIMIT_MB: "1024"
+      ATLAS_HOST_PORT: "18085"
+    volumes:
+      - atlas-postgres:/var/lib/postgresql/data
+      - type: bind
+        source: .
+        target: /project
+        read_only: true
+    ports:
+      - "127.0.0.1:18085:8080"
+    stop_grace_period: 30s
+
+volumes:
+  atlas-postgres:

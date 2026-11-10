@@ -1,0 +1,13 @@
+{
+  "name": "atlas/probe-project",
+  "description": "Fixture project for Atlas PLUGIN-05 expression acceptance",
+  "require": {
+    "php": ">=8.1"
+  },
+  "autoload": {
+    "psr-4": {
+      "App\\": "app/",
+      "admin\\controllers\\": "admin/controllers/"
+    }
+  }
+}

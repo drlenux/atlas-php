@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "atlas": {
+      "type": "http",
+      "url": "http://localhost:${ATLAS_HOST_PORT:-8080}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${ATLAS_AGENT_TOKEN}"
+      }
+    }
+  }
+}
