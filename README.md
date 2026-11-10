@@ -37,7 +37,7 @@ docker compose logs -f atlas
 
 По умолчанию веб доступен на `http://localhost:8080`, MCP — на `http://localhost:8080/mcp`. При другом `ATLAS_HOST_PORT` используйте соответствующий порт. На веб-странице введите reviewer-токен; он хранится в памяти открытой страницы. HTTP MCP принимает `Authorization: Bearer <ATLAS_AGENT_TOKEN>`.
 
-Для агента: шаблон MCP-сервера — [examples/mcp.json.example](examples/mcp.json.example); skill навигации по графу — [examples/skills/atlas-navigation/SKILL.md](examples/skills/atlas-navigation/SKILL.md) (скопируйте в `.claude/skills/atlas-navigation/` исследуемого проекта).
+Для агента: шаблон MCP-сервера — [examples/mcp.json.example](examples/mcp.json.example); skill навигации — [examples/skills/atlas-navigation/](examples/skills/atlas-navigation/) (`SKILL.md` + `reference.md`; скопируйте каталог в `.claude/skills/atlas-navigation/` исследуемого проекта).
 
 Первичная индексация запускается автоматически. Доступность HTTP и успешный healthcheck ещё не означают готовность графа: дождитесь завершения публикации в панели или сообщения `100% committed` в логах.
 
