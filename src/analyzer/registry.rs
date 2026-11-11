@@ -1,6 +1,9 @@
 use super::{AnalysisOptions, FrameworkPlugin, LanguagePlugin, SourceFile};
-use crate::domain::GraphSnapshot;
-use std::{collections::BTreeSet, path::Path};
+use crate::domain::{Edge, GraphSnapshot, Node};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 pub struct PluginRegistry {
     languages: Vec<Box<dyn LanguagePlugin>>,
@@ -150,9 +153,9 @@ impl PluginRegistry {
                 framework.enrich(&enrich_files, &mut graph, options)?;
             }
             super::sync_occurrence_resolution(&mut graph);
-            result.nodes.extend(graph.nodes);
-            result.edges.extend(graph.edges);
-            result.diagnostics.extend(graph.diagnostics);
+            // Languages share stable IDs (table:/schema: from SQL-in-PHP and .sql).
+            // Vec::extend would publish duplicates and fail apply_snapshot.
+            merge_language_graph(&mut result, graph);
             options.check(result.nodes.len() + result.edges.len() + result.diagnostics.len())?;
         }
         label_areas(&mut result, &options.areas);
@@ -173,6 +176,42 @@ impl PluginRegistry {
             .ok_or_else(|| format!("unknown framework plugin: {id}"))
     }
 }
+/// Fold another language graph into `into`, keeping one node/edge per ID.
+/// Prefer a non-`external` declaration; otherwise the later language wins so a
+/// `.sql` CREATE TABLE replaces an SQL-in-PHP stub with the same `table:` id.
+fn merge_language_graph(into: &mut GraphSnapshot, from: GraphSnapshot) {
+    let mut nodes: BTreeMap<String, Node> =
+        into.nodes.drain(..).map(|n| (n.id.clone(), n)).collect();
+    for node in from.nodes {
+        let replace = match nodes.get(&node.id) {
+            None => true,
+            Some(existing) => {
+                let existing_external =
+                    existing.metadata.get("external") == Some(&serde_json::json!(true));
+                let incoming_external =
+                    node.metadata.get("external") == Some(&serde_json::json!(true));
+                match (existing_external, incoming_external) {
+                    (true, false) => true,
+                    (false, true) => false,
+                    _ => true, // same authority: later language wins
+                }
+            }
+        };
+        if replace {
+            nodes.insert(node.id.clone(), node);
+        }
+    }
+    into.nodes = nodes.into_values().collect();
+
+    let mut edges: BTreeMap<String, Edge> =
+        into.edges.drain(..).map(|e| (e.id.clone(), e)).collect();
+    for edge in from.edges {
+        edges.insert(edge.id.clone(), edge);
+    }
+    into.edges = edges.into_values().collect();
+    into.diagnostics.extend(from.diagnostics);
+}
+
 /// Every node under an area carries its prefix (`metadata.area`), whatever the plugin.
 fn label_areas(graph: &mut GraphSnapshot, areas: &[crate::domain::Area]) {
     if areas.is_empty() {

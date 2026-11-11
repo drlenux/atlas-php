@@ -1,5 +1,5 @@
-pub mod php;
 pub mod pgsql;
+pub mod php;
 pub mod yii2;
 
 pub fn registry() -> crate::analyzer::PluginRegistry {

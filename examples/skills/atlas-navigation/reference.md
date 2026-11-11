@@ -58,6 +58,20 @@ not stop siblings).
   `view`, `function`, `index`, plus `contains` / `references` / `indexes`.
 - AR attribute writes remain `write_site`, not `sql_site`.
 
+## declaration_paths and ActiveRecord parents
+
+Default `index.declaration_paths` is often only `vendor/yiisoft`. App models that
+`extend` a library base outside that list (e.g. `Da\User\Model\User` under
+`vendor/2amigos`) still get `X::find()` → `ActiveQuery<X>` via an unindexed-parent
+fallback, but other inherited members stay invisible. Prefer adding the real vendor
+prefix to `declaration_paths` when you need the full base class.
+
+## Switch / case
+
+Each `case` / `default` is a fresh entry: a `return` or `break` in one arm does
+**not** mark later arms `unreachable_after_exit` (provider callbacks with
+`case 'credit': return …; case 'bet': …`).
+
 ## Result quirks
 
 - `atlas_context` trees: `[area]` prefix on lines; `omitted_members=N` → use outline

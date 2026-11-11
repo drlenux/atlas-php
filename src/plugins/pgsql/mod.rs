@@ -30,6 +30,13 @@ impl LanguagePlugin for PgsqlLanguagePlugin {
         let mut nodes = BTreeMap::new();
         let mut edges = BTreeMap::new();
         let mut diagnostics = Vec::new();
+        // declaration_paths (e.g. vendor/yiisoft) are PHP API surfaces, not project DDL.
+        // Yii ships schema-sqlite.sql / schema-mysql.sql there — indexing them pollutes
+        // table:/index: IDs and trips publish when statement errors mark the file failed.
+        let files: Vec<_> = files
+            .iter()
+            .filter(|file| !options.declaration_only(&file.path))
+            .collect();
         options
             .progress
             .phase("analysis", "pgsql_parse", Some(files.len()), "files");
@@ -84,10 +91,7 @@ pub fn embed_sql(
         Node {
             id: site_id.clone(),
             kind: "sql_site".into(),
-            name: parsed
-                .operation
-                .clone()
-                .unwrap_or_else(|| "sql".into()),
+            name: parsed.operation.clone().unwrap_or_else(|| "sql".into()),
             qualified_name: site_id.clone(),
             span: crate::domain::SourceSpan {
                 path: path.into(),

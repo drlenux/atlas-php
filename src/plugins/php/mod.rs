@@ -159,21 +159,24 @@ fn analyze_files(
         .set_workers(workers.min(functions.len().max(1)));
     let base_nodes = std::mem::take(&mut project.nodes);
     let base_edges = std::mem::take(&mut project.edges);
-    // Pass 1: collect body returns. Pass 2: callers see inferred_return of callees.
-    let pass1 = run_flow_pass(
-        &functions,
-        &base_nodes,
-        base_edges.len(),
-        &project,
-        options,
-        workers,
-    )?;
-    for (position, outcome) in pass1.into_iter().enumerate() {
-        let function = &functions[position];
-        if let Ok((nodes, _, _)) = outcome {
-            if let Some(inferred) = inferred_return(function, nodes.get(&function.id)) {
-                if let Some(f) = project.functions.get_mut(&function.id) {
-                    f.inferred_return = Some(inferred);
+    // Pass 1: collect body returns. Drop the pass before pass 2 so peak RSS is not
+    // ~2× every function graph (1 GiB containers OOM on large projects).
+    {
+        let pass1 = run_flow_pass(
+            &functions,
+            &base_nodes,
+            base_edges.len(),
+            &project,
+            options,
+            workers,
+        )?;
+        for (position, outcome) in pass1.into_iter().enumerate() {
+            let function = &functions[position];
+            if let Ok((nodes, _, _)) = outcome {
+                if let Some(inferred) = inferred_return(function, nodes.get(&function.id)) {
+                    if let Some(f) = project.functions.get_mut(&function.id) {
+                        f.inferred_return = Some(inferred);
+                    }
                 }
             }
         }
@@ -1090,16 +1093,56 @@ impl<'a> Project<'a> {
         });
     }
     fn origins(&mut self) {
-        let nodes = self.nodes.clone();
+        // Only materialize definitions that returns actually reference — cloning the
+        // whole node map doubled peak memory on php_finalize for large graphs.
+        let mut needed: BTreeSet<String> = BTreeSet::new();
+        for n in self.nodes.values() {
+            if let Some(returns) = n.metadata["returns"].as_array() {
+                for r in returns {
+                    if let Some(origins) = r["origins"].as_array() {
+                        for origin in origins {
+                            if let Some(id) = origin["symbol_id"].as_str() {
+                                needed.insert(id.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let defs: BTreeMap<String, Value> = needed
+            .into_iter()
+            .filter_map(|id| {
+                let target = self.nodes.get(&id)?;
+                Some((
+                    id,
+                    json!({
+                        "id": target.id,
+                        "span": target.span,
+                        "returns": target.metadata["returns"].as_array().map(|rs| {
+                            rs.iter()
+                                .map(|r| {
+                                    json!({
+                                        "line": r["line"],
+                                        "expression": r["expression"],
+                                        "type": r["type"],
+                                        "snippet": r["snippet"]
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        }).unwrap_or_default()
+                    }),
+                ))
+            })
+            .collect();
         for n in self.nodes.values_mut() {
             if let Some(returns) = n.metadata["returns"].as_array_mut() {
                 for r in returns {
                     if let Some(origins) = r["origins"].as_array_mut() {
                         for origin in origins {
-                            if let Some(target) =
-                                origin["symbol_id"].as_str().and_then(|id| nodes.get(id))
+                            if let Some(def) =
+                                origin["symbol_id"].as_str().and_then(|id| defs.get(id))
                             {
-                                origin["definition"] = json!({"id":target.id,"span":target.span,"returns":target.metadata["returns"].as_array().map(|rs|rs.iter().map(|r|json!({"line":r["line"],"expression":r["expression"],"type":r["type"],"snippet":r["snippet"]})).collect::<Vec<_>>()).unwrap_or_default()});
+                                origin["definition"] = def.clone();
                             }
                         }
                     }

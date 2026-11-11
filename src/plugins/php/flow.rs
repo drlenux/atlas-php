@@ -357,6 +357,9 @@ impl Scope<'_, '_> {
                 if stop == end {
                     return Err("case requires colon or semicolon".into());
                 }
+                // Each case/default is a fresh entry of the switch jump table: a prior
+                // `return`/`break` must not mark this arm unreachable_after_exit.
+                terminated = false;
                 conditions.push(self.unit.text(i, stop));
                 i = stop + 1;
                 continue;
@@ -427,6 +430,9 @@ impl Scope<'_, '_> {
                 continue;
             }
             if ["break", "continue"].iter().any(|v| self.unit.is(i, v)) {
+                // Leaves the current switch arm / loop body; following statements in
+                // this sequential scan are dead until the next `case`/`default`.
+                terminated = true;
                 i = self.unit.end_statement(i, end).saturating_add(1);
                 continue;
             }
@@ -1960,16 +1966,19 @@ impl Scope<'_, '_> {
         else {
             return None;
         };
-        call.target.as_ref()?;
         let class = if *static_ {
             let Kind::Name(name) = &receiver.kind else {
                 return None;
             };
             self.resolve_class(name)
         } else {
+            // Instance refinements (relation getters) need a typed receiver.
             class_parts(&call.matched.name).into_iter().next()?
         };
         let (type_name, exact) = self.framework_return_of(&class, member)?;
+        // Apply even when the call target is unresolved: e.g. User::find() while the
+        // library parent that declares find() is outside declaration_paths — Yii still
+        // attached ActiveQuery<User> on the model class.
         Some(Typed {
             name: type_name,
             annotated: call.annotated,

@@ -152,7 +152,11 @@ fn outline_tokens(tokens: &[Token]) -> SqlOutline {
     SqlOutline { tables, operation }
 }
 
-fn collect_ctes(tokens: &[Token], mut i: usize, ctes: &mut std::collections::BTreeSet<String>) -> usize {
+fn collect_ctes(
+    tokens: &[Token],
+    mut i: usize,
+    ctes: &mut std::collections::BTreeSet<String>,
+) -> usize {
     loop {
         let Some(name) = tokens.get(i).and_then(Token::as_ident).map(str::to_owned) else {
             return i;
@@ -294,9 +298,7 @@ fn push_table(
         return;
     }
     // Skip obvious non-tables (SELECT pg_stat… / functions without FROM).
-    if schema == "public"
-        && name.contains('(')
-    {
+    if schema == "public" && name.contains('(') {
         return;
     }
     tables.push(TableRef {

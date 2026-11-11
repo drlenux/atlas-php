@@ -210,7 +210,8 @@ impl Config {
             // Finer occurrence/branch nodes need headroom on mid-size PHP trees.
             max_graph_elements: env.number("ATLAS_MAX_GRAPH_ELEMENTS", 2_000_000, 1, 20_000_000)?
                 as usize,
-            analysis_timeout_secs: env.number("ATLAS_ANALYSIS_TIMEOUT_SECS", 120, 1, 3600)?,
+            // Large PHP/Yii trees with 1 worker need ~10 min; 120 s aborted full Slotor passes.
+            analysis_timeout_secs: env.number("ATLAS_ANALYSIS_TIMEOUT_SECS", 900, 1, 3600)?,
             cpu_limit,
             index_workers,
             memory_limit_mb: env.number("ATLAS_MEMORY_LIMIT_MB", 1024, 64, 1_048_576)?,

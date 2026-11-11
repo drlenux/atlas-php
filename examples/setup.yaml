@@ -20,6 +20,7 @@ index:
   # true: analyze vendor/ fully (slow on large projects).
   include_vendor: false
   # Library paths indexed for declarations only (classes, methods, PHPDoc), even with vendor excluded.
+  # Include every vendor prefix that app models extend (e.g. vendor/2amigos for Da\User), not only yiisoft.
   declaration_paths: [vendor/yiisoft]
   # php: always; add pgsql to index .sql/.pgsql files (SQL inside PHP createCommand/findBySql works with php alone).
   languages: [php]
@@ -30,7 +31,8 @@ index:
   max_file_bytes: 2097152          # largest analyzed source file
   max_analysis_bytes: 67108864     # total source text of one pass
   max_graph_elements: 2000000      # nodes + edges + diagnostics
-  analysis_timeout_secs: 120
+  # Full Slotor-sized passes with 1 CPU need ~10 min; raise further if analysis times out.
+  analysis_timeout_secs: 900
   debounce_ms: 5000                # wait after the last file change before reindexing
   poll_ms: 1000                    # file watcher period
 

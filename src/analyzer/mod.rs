@@ -84,7 +84,7 @@ impl Default for AnalysisOptions {
         Self {
             language_versions: BTreeMap::new(),
             max_graph_elements: 2_000_000,
-            deadline: Instant::now() + Duration::from_secs(120),
+            deadline: Instant::now() + Duration::from_secs(900),
             workers: 1,
             progress: Default::default(),
             declaration_paths: Vec::new(),

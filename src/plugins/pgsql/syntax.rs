@@ -122,10 +122,12 @@ pub fn parse_file(file: &SourceFile, options: &AnalysisOptions) -> Result<Unit, 
                 at = next;
             }
             Err(message) => {
+                // Statement-level: keep other declarations. Not `parse_error` — that code
+                // marks the whole file failed in the indexer and drops it from publish scope.
                 unit.diagnostics.push(Diagnostic {
                     path: file.path.clone(),
                     line: unit.tokens[at].line,
-                    code: "parse_error".into(),
+                    code: "sql_statement_error".into(),
                     message,
                 });
                 // Ignore paren depth: a broken `(;` must not swallow the next statement.
@@ -136,24 +138,18 @@ pub fn parse_file(file: &SourceFile, options: &AnalysisOptions) -> Result<Unit, 
     Ok(unit)
 }
 
-fn parse_statement(
-    tokens: &[Token],
-    start: usize,
-) -> Result<(Option<Declaration>, usize), String> {
+fn parse_statement(tokens: &[Token], start: usize) -> Result<(Option<Declaration>, usize), String> {
     if !tokens[start].is("create") {
         return Ok((None, skip_statement(tokens, start)));
     }
     let mut i = start + 1;
     skip_create_noise(tokens, &mut i);
-    let keyword = tokens
-        .get(i)
-        .and_then(Token::as_ident)
-        .ok_or_else(|| {
-            format!(
-                "expected object kind after CREATE at line {}",
-                tokens[start].line
-            )
-        })?;
+    let keyword = tokens.get(i).and_then(Token::as_ident).ok_or_else(|| {
+        format!(
+            "expected object kind after CREATE at line {}",
+            tokens[start].line
+        )
+    })?;
     match keyword {
         "schema" => {
             i += 1;
@@ -485,9 +481,7 @@ fn expect_qualified(tokens: &[Token], i: &mut usize) -> Result<QualifiedName, St
 }
 
 fn expect_symbol(tokens: &[Token], i: &mut usize, symbol: &str) -> Result<(), String> {
-    let t = tokens
-        .get(*i)
-        .ok_or_else(|| format!("expected {symbol}"))?;
+    let t = tokens.get(*i).ok_or_else(|| format!("expected {symbol}"))?;
     if t.text != symbol {
         return Err(format!("expected {symbol} at line {}", t.line));
     }

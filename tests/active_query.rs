@@ -154,3 +154,46 @@ fn library_query_without_model_parameter_is_bound_to_the_called_model() {
         Some("method:common\\models\\Wallet::deposit")
     );
 }
+
+#[test]
+fn find_still_binds_when_library_parent_is_outside_declaration_paths() {
+    // Default declaration_paths cover only yiisoft; Da\User is missing — common\models\User
+    // still needs User::find()->one() typed like ActiveRecord (slotor BaseUser gap).
+    let files: Vec<_> = [
+        ("vendor/yiisoft/yii2/db/All.php", YII),
+        ("common/models/User.php", APP_USER_ONLY),
+    ]
+    .iter()
+    .map(|(path, source)| SourceFile {
+        path: (*path).into(),
+        source: (*source).into(),
+    })
+    .collect();
+    let options = AnalysisOptions {
+        declaration_paths: vec!["vendor/yiisoft".into()],
+        ..AnalysisOptions::default()
+    };
+    let g = code_atlas::plugins::registry()
+        .analyze(&files, &["php".into()], &["yii2".into()], &options)
+        .unwrap();
+    assert_eq!(
+        call(&g, "getWallet", "$u").to.as_deref(),
+        Some("method:common\\models\\User::getWallet"),
+        "User::find()->one() must type as User even when Da\\User\\Model\\User is unindexed"
+    );
+}
+
+const APP_USER_ONLY: &str = r#"<?php
+namespace common\models;
+class Wallet { public function deposit($amount) {} }
+class User extends \Da\User\Model\User {
+  public function getWallet(): Wallet { return new Wallet(); }
+}
+class Process {
+  public function run() {
+    $u = User::find()->where(['uid' => 1])->one();
+    $wallet = $u->getWallet();
+    $wallet->deposit(1);
+  }
+}
+"#;

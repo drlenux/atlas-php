@@ -2077,25 +2077,39 @@ fn apply_snapshot(
         .map(|e| (e.id.clone(), e))
         .collect();
     progress.advance(scopes.len(), None);
-    let incoming_ids: BTreeSet<_> = snapshot.nodes.iter().map(|n| n.id.clone()).collect();
-    if incoming_ids.len() != snapshot.nodes.len() {
-        return Err(AtlasError::invalid("duplicate node ID in snapshot"));
+    let mut incoming_ids = BTreeSet::new();
+    for node in &snapshot.nodes {
+        if !incoming_ids.insert(node.id.clone()) {
+            return Err(AtlasError::invalid(format!(
+                "duplicate node ID in snapshot: {}",
+                node.id
+            )));
+        }
     }
-    if snapshot
-        .edges
-        .iter()
-        .map(|e| &e.id)
-        .collect::<BTreeSet<_>>()
-        .len()
-        != snapshot.edges.len()
-    {
-        return Err(AtlasError::invalid("duplicate edge ID in snapshot"));
+    let mut incoming_edge_ids = BTreeSet::new();
+    for edge in &snapshot.edges {
+        if !incoming_edge_ids.insert(edge.id.clone()) {
+            return Err(AtlasError::invalid(format!(
+                "duplicate edge ID in snapshot: {}",
+                edge.id
+            )));
+        }
     }
     for node in &snapshot.nodes {
-        if node.id.is_empty() || !node.metadata.is_object() || !scopes.contains(&node.span.path) {
-            return Err(AtlasError::invalid(
-                "invalid node or node outside successful index scope",
-            ));
+        if node.id.is_empty() {
+            return Err(AtlasError::invalid("empty node ID in snapshot"));
+        }
+        if !node.metadata.is_object() {
+            return Err(AtlasError::invalid(format!(
+                "node {} metadata is not an object",
+                node.id
+            )));
+        }
+        if !scopes.contains(&node.span.path) {
+            return Err(AtlasError::invalid(format!(
+                "node {} path {} outside successful index scope",
+                node.id, node.span.path
+            )));
         }
     }
     let mut remap = BTreeMap::new();

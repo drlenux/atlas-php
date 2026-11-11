@@ -75,14 +75,17 @@ class WalletService {
 "#,
     );
     assert!(
-        ids("sql_site", &g).iter().any(|id| id.contains("method:App\\WalletService::debit")),
+        ids("sql_site", &g)
+            .iter()
+            .any(|id| id.contains("method:App\\WalletService::debit")),
         "expected sql_site in debit, got {:?}",
         ids("sql_site", &g)
     );
     assert!(ids("table", &g).contains(&"table:public.wallet"));
-    assert!(g.edges.iter().any(|e| {
-        e.kind == "sql_writes" && e.to.as_deref() == Some("table:public.wallet")
-    }));
+    assert!(g
+        .edges
+        .iter()
+        .any(|e| { e.kind == "sql_writes" && e.to.as_deref() == Some("table:public.wallet") }));
 }
 
 #[test]
@@ -103,9 +106,10 @@ class Repo {
     );
     assert!(ids("table", &g).contains(&"table:public.user_bonus"));
     assert!(ids("table", &g).contains(&"table:public.game_session"));
-    assert!(g.edges.iter().any(|e| {
-        e.kind == "sql_reads" && e.to.as_deref() == Some("table:public.user_bonus")
-    }));
+    assert!(g
+        .edges
+        .iter()
+        .any(|e| { e.kind == "sql_reads" && e.to.as_deref() == Some("table:public.user_bonus") }));
     assert!(g.edges.iter().any(|e| {
         e.kind == "sql_reads" && e.to.as_deref() == Some("table:public.game_session")
     }));
@@ -156,7 +160,96 @@ CREATE TABLE also_ok (name text);
     );
     assert!(ids("table", &g).contains(&"table:public.ok"));
     assert!(ids("table", &g).contains(&"table:public.also_ok"));
-    assert!(g.diagnostics.iter().any(|d| d.code == "parse_error"));
+    assert!(g
+        .diagnostics
+        .iter()
+        .any(|d| d.code == "sql_statement_error"));
+}
+
+#[test]
+fn declaration_paths_skip_vendor_sql_ddl() {
+    let files = vec![
+        SourceFile {
+            path: "vendor/yiisoft/yii2/i18n/migrations/schema-sqlite.sql".into(),
+            source: "CREATE INDEX idx_message_language ON message (language);\n".into(),
+        },
+        SourceFile {
+            path: "schema.sql".into(),
+            source: "CREATE TABLE wallet (id int);\n".into(),
+        },
+    ];
+    let options = AnalysisOptions {
+        declaration_paths: vec!["vendor/yiisoft".into()],
+        ..Default::default()
+    };
+    let g = code_atlas::plugins::registry()
+        .analyze(&files, &["pgsql".into()], &[], &options)
+        .unwrap();
+    assert!(
+        !ids("index", &g)
+            .iter()
+            .any(|id| id.contains("idx_message_language")),
+        "vendor declaration_paths SQL must not enter the graph"
+    );
+    assert!(ids("table", &g).contains(&"table:public.wallet"));
+}
+
+#[test]
+fn php_and_pgsql_share_table_ids_without_duplicates() {
+    // Slotor enables languages: [php, pgsql]. Embedded SQL stubs and .sql
+    // CREATE TABLE both emit table:/schema: IDs — the registry must keep one.
+    let files = vec![
+        SourceFile {
+            path: "Wallet.php".into(),
+            source: r#"<?php
+namespace App;
+class WalletService {
+    function debit($db, $amount, $id) {
+        return $db->createCommand(
+            'UPDATE wallet SET amount = amount - :amount WHERE id = :id',
+            [':amount' => $amount, ':id' => $id]
+        )->execute();
+    }
+}
+"#
+            .into(),
+        },
+        SourceFile {
+            path: "schema.sql".into(),
+            source: "CREATE TABLE wallet (id int PRIMARY KEY, amount numeric);\n".into(),
+        },
+    ];
+    let g = code_atlas::plugins::registry()
+        .analyze(
+            &files,
+            &["php".into(), "pgsql".into()],
+            &[],
+            &AnalysisOptions::default(),
+        )
+        .unwrap();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut dupes = Vec::new();
+    for node in &g.nodes {
+        if !seen.insert(node.id.clone()) {
+            dupes.push(node.id.clone());
+        }
+    }
+    assert!(dupes.is_empty(), "duplicate node IDs: {dupes:?}");
+    assert!(ids("table", &g).contains(&"table:public.wallet"));
+    assert!(
+        g.nodes
+            .iter()
+            .any(|n| n.id == "table:public.wallet" && n.span.path.ends_with(".sql")),
+        "pgsql declaration should win over PHP stub"
+    );
+    let mut edge_seen = std::collections::BTreeSet::new();
+    let mut edge_dupes = Vec::new();
+    for edge in &g.edges {
+        if !edge_seen.insert(edge.id.clone()) {
+            edge_dupes.push(edge.id.clone());
+        }
+    }
+    assert!(edge_dupes.is_empty(), "duplicate edge IDs: {edge_dupes:?}");
 }
 
 #[test]

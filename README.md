@@ -72,7 +72,7 @@ index:
 | `index.max_file_bytes` | `2097152`: до 2 MiB на файл анализа. |
 | `index.max_analysis_bytes` | `67108864`: до 64 MiB суммарного текста за проход. |
 | `index.max_graph_elements` | `2000000`: вершины, рёбра и диагностики. |
-| `index.analysis_timeout_secs` | `120`: ограничение времени анализа, проверяемое внутри конвейера. |
+| `index.analysis_timeout_secs` | `900`: лимит времени одного прохода анализа (на 1 CPU крупные Yii-проекты ~10 мин). |
 | `index.debounce_ms`, `index.poll_ms` | `5000`, `1000`: ожидание после последней правки и период сканирования. |
 | `grep.exclude`, `grep.max_file_bytes` | Исключения только текстового поиска; лимит файла `16777216` (16 MiB). |
 | `tests.paths` | `["tests/*", "*/tests/*", "*Test.php", "*Cest.php"]`: тесты скрыты от агентского поиска и списка вызывающих без `include_tests: true`. |

@@ -269,6 +269,12 @@ impl IndexCoordinator {
             })
             .map(|d| d.path.clone())
             .collect();
+        // Nodes from a failed file must not remain: apply_snapshot requires every
+        // node path to be in indexed_paths (successful scope).
+        if !failed.is_empty() {
+            snapshot.nodes.retain(|n| !failed.contains(&n.span.path));
+            snapshot.edges.retain(|e| !failed.contains(&e.span.path));
+        }
         let indexed_paths: Vec<_> = files
             .into_iter()
             .filter(|path| !failed.contains(path))
