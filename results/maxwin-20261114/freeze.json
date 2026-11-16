@@ -1,7 +1,0 @@
-{
-  "slotor_commit": "67e57a4376258503c0651ede23e296de33d7aa3f",
-  "atlas_health": "{\"panics\":0,\"service\":\"code-atlas\",\"status\":\"ok\"}",
-  "gold": "/Users/eselbelokudrenko/Projects/memory/bench/gold/maxwin.yaml",
-  "model": "opus",
-  "n": 5
-}
