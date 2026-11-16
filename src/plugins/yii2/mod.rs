@@ -1,5 +1,6 @@
 //! Native Yii 2 enrichment. Consumes PHP facts and source text; never executes project code.
 mod events;
+mod models;
 mod params;
 mod syntax;
 mod urls;
@@ -35,6 +36,12 @@ impl FrameworkPlugin for Yii2Plugin {
             .phase("analysis", "yii2_members", None, "items");
         let mut nodes = relation_members(&index, &declarations.nodes, files, options)?;
         nodes.extend(query_members(&index, &declarations.nodes, options));
+        nodes.extend(models::attribute_members(
+            &index,
+            &declarations.nodes,
+            files,
+            options,
+        )?);
         let (components, diagnostics) = component_members(&index, files, options)?;
         nodes.extend(components);
         Ok(GraphSnapshot {
@@ -87,9 +94,15 @@ impl FrameworkPlugin for Yii2Plugin {
                 options.check(graph.nodes.len() + graph.edges.len())?;
                 let (method, key) = &behavior_jobs[position];
                 options.progress.work_started(&method.span.path);
-                let classes = behavior_classes(method, files, options);
+                // Lex/parse gaps in a behaviors() body must not abort the whole index
+                // (vendor Component.php and similar trip "unterminated quoted string").
+                let classes =
+                    behavior_classes(method, files, options).unwrap_or_else(|_| Classes {
+                        unknown: true,
+                        ..Default::default()
+                    });
                 options.progress.work_finished(&method.span.path);
-                *slot = Some(classes.map(|classes| (key.clone(), classes)));
+                *slot = Some(Ok((key.clone(), classes)));
                 Ok(())
             },
         )?;
@@ -102,9 +115,12 @@ impl FrameworkPlugin for Yii2Plugin {
         // Calls that no class, ancestor, descendant or attached behavior declares.
         let mut undeclared_sites: BTreeSet<String> = BTreeSet::new();
         let mut undeclared_locations: BTreeSet<(String, usize)> = BTreeSet::new();
-        for edge in &mut graph.edges {
-            options
-                .check(index.classes.len() + index.method_nodes.len() + graph.diagnostics.len())?;
+        for (edge_i, edge) in graph.edges.iter_mut().enumerate() {
+            if edge_i % 1024 == 0 {
+                options.check(
+                    index.classes.len() + index.method_nodes.len() + graph.diagnostics.len(),
+                )?;
+            }
             if !matches!(edge.kind.as_str(), "calls" | "property_access") || edge.to.is_some() {
                 continue;
             }
@@ -275,6 +291,7 @@ impl FrameworkPlugin for Yii2Plugin {
         graph.diagnostics.extend(diagnostics);
         let dispatches = queue_dispatches(&index, &graph.edges);
         let rules_edges = rules_validator_edges(&index, files, graph, options)?;
+        let table_links = models::collect_table_links(files, graph, &index, options)?;
         drop(index);
         for node in &mut graph.nodes {
             if undeclared_sites.contains(&node.id) {
@@ -283,6 +300,9 @@ impl FrameworkPlugin for Yii2Plugin {
         }
         graph.edges.extend(dispatches);
         graph.edges.extend(rules_edges);
+        models::apply_table_links(graph, table_links);
+        models::apply_ddl_column_links(graph);
+        models::link_sql_sites_to_properties(graph);
         urls::enrich_urls(files, graph, options)?;
         events::enrich_events(files, graph, options)?;
         views::enrich_views(files, graph, options)?;
@@ -291,14 +311,18 @@ impl FrameworkPlugin for Yii2Plugin {
     }
 }
 
-struct Index<'a> {
+pub(super) struct Index<'a> {
     classes: BTreeMap<String, &'a Node>,
     method_nodes: BTreeMap<(String, String), Vec<&'a Node>>,
     available: BTreeMap<String, Vec<&'a Node>>,
+    /// Proven subclasses (normalized name → normalized descendant names).
+    descendants: BTreeMap<String, Vec<String>>,
+    /// Classes whose parent chain leaves the index (possible hidden placement in the tree).
+    incomplete: Vec<String>,
 }
 impl<'a> Index<'a> {
     fn new(nodes: &'a [Node], edges: &[Edge]) -> Self {
-        let classes = nodes
+        let classes: BTreeMap<String, &Node> = nodes
             .iter()
             .filter(|n| matches!(n.kind.as_str(), "class" | "trait" | "interface"))
             .map(|n| (normalize(&n.qualified_name), n))
@@ -326,10 +350,65 @@ impl<'a> Index<'a> {
                     .push(target);
             }
         }
+        let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (name, node) in &classes {
+            if let Some(parent) = node.metadata["parent"].as_str() {
+                children
+                    .entry(normalize(parent))
+                    .or_default()
+                    .push(name.clone());
+            }
+            if let Some(traits) = node.metadata["traits"].as_array() {
+                for trait_name in traits.iter().filter_map(Value::as_str) {
+                    children
+                        .entry(normalize(trait_name))
+                        .or_default()
+                        .push(name.clone());
+                }
+            }
+        }
+        let mut descendants: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for root in classes.keys() {
+            let mut stack = children.get(root).cloned().unwrap_or_default();
+            let mut seen = BTreeSet::from([root.clone()]);
+            let mut out = Vec::new();
+            while let Some(next) = stack.pop() {
+                if !seen.insert(next.clone()) {
+                    continue;
+                }
+                out.push(next.clone());
+                if let Some(more) = children.get(&next) {
+                    stack.extend(more.iter().cloned());
+                }
+            }
+            if !out.is_empty() {
+                descendants.insert(root.clone(), out);
+            }
+        }
+        let incomplete: Vec<String> = classes
+            .keys()
+            .filter(|name| {
+                let mut current = (*name).clone();
+                let mut seen = BTreeSet::new();
+                while seen.insert(current.clone()) {
+                    let Some(node) = classes.get(&current) else {
+                        return true;
+                    };
+                    match node.metadata["parent"].as_str() {
+                        Some(parent) => current = normalize(parent),
+                        None => return false,
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
         Self {
             classes,
             method_nodes,
             available,
+            descendants,
+            incomplete,
         }
     }
     fn is_a(&self, class: &str, base: &str) -> bool {
@@ -351,30 +430,27 @@ impl<'a> Index<'a> {
         }
         false
     }
-    /// A class below `class` (directly or through a trait) declares `name`, or a class whose
-    /// ancestry leaves the index (a possible unseen descendant) does: the call may succeed.
+    /// A class below `class` declares `name`: proven descendants, or a class whose
+    /// ancestry leaves the index (it may sit under `class` via a missing vendor parent).
+    /// Incomplete classes are listed once in `Index`; we do not run `is_a` over the
+    /// whole class table per edge (that dominated Yii time on Slotor).
     fn declared_below(&self, class: &str, name: &str) -> bool {
         let base = normalize(class);
         let name = name.to_lowercase();
-        self.classes.keys().filter(|c| **c != base).any(|c| {
-            (self.is_a(c, &base) || !self.ancestry_indexed(c))
-                && !self.find_methods(c, &name, &mut BTreeSet::new()).is_empty()
-        })
+        let has = |c: &str| !self.find_methods(c, &name, &mut BTreeSet::new()).is_empty();
+        self.descendants
+            .get(&base)
+            .into_iter()
+            .flatten()
+            .any(|c| has(c))
+            || self.incomplete.iter().any(|c| c != &base && has(c))
     }
-    /// Every parent up the chain is an indexed class.
-    fn ancestry_indexed(&self, class: &str) -> bool {
-        let mut current = normalize(class);
-        let mut seen = BTreeSet::new();
-        while seen.insert(current.clone()) {
-            let Some(node) = self.classes.get(&current) else {
-                return false;
-            };
-            match node.metadata["parent"].as_str() {
-                Some(parent) => current = normalize(parent),
-                None => return true,
-            }
-        }
-        true
+    /// `extends` names a class that is not in the index (outside declaration_paths).
+    fn parent_unindexed(&self, class: &str) -> bool {
+        self.classes
+            .get(&normalize(class))
+            .and_then(|n| n.metadata["parent"].as_str())
+            .is_some_and(|parent| !self.classes.contains_key(&normalize(parent)))
     }
     fn is_yii_object(&self, class: &str) -> bool {
         self.is_a(class, "yii\\base\\Component") || self.is_a(class, "yii\\base\\BaseObject")
@@ -642,7 +718,10 @@ fn component_receiver(edge: &Edge, options: &AnalysisOptions) -> Result<Option<S
     let expression = edge.metadata["receiver_expression"]
         .as_str()
         .unwrap_or_default();
-    let tokens = syntax::fragment(expression, options)?;
+    // Clipped/odd expressions must not abort enrich (same for behaviors() bodies).
+    let Ok(tokens) = syntax::fragment(expression, options) else {
+        return Ok(None);
+    };
     if tokens.len() == 5
         && tokens[1].text == "::"
         && tokens[2].text == "$app"
@@ -710,7 +789,7 @@ fn relation_property_call(edge: &Edge, getter: String) -> Edge {
         revision: 0,
     }
 }
-fn method_source(method: &Node, files: &[SourceFile]) -> String {
+pub(super) fn method_source(method: &Node, files: &[SourceFile]) -> String {
     method_body(method, files).0
 }
 
@@ -910,7 +989,7 @@ fn identifier(name: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_alphanumeric())
 }
 
-const RELATION_BASES: [&str; 2] = ["yii\\db\\BaseActiveRecord", "yii\\db\\ActiveRecord"];
+pub(super) const RELATION_BASES: [&str; 2] = ["yii\\db\\BaseActiveRecord", "yii\\db\\ActiveRecord"];
 
 /// `getX()` whose only top-level statement is `return $this->hasOne|hasMany(Cls, …)…;`
 /// becomes property `x` typed `Cls|null` or `Cls[]`.
@@ -1240,16 +1319,31 @@ fn query_members(index: &Index, nodes: &[Node], options: &AnalysisOptions) -> Ve
         .iter()
         .filter(|n| n.kind == "class")
         .filter(|n| !options.declaration_only(&n.span.path))
-        .filter(|n| {
-            RELATION_BASES
-                .iter()
-                .any(|base| index.is_a(&n.qualified_name, base))
-        })
         .filter_map(|model| {
+            let known_ar = RELATION_BASES
+                .iter()
+                .any(|base| index.is_a(&model.qualified_name, base));
+            let unindexed_parent = index.parent_unindexed(&model.qualified_name);
+            // Proven ActiveRecord, or extends a vendor parent outside declaration_paths
+            // (e.g. common\models\User → Da\User\Model\User while only yiisoft is indexed).
+            if !known_ar && !unindexed_parent {
+                return None;
+            }
             let find = index
                 .methods(&model.qualified_name, "find")
                 .into_iter()
-                .next()?;
+                .next()
+                .or_else(|| {
+                    index
+                        .methods("yii\\db\\ActiveRecord", "find")
+                        .into_iter()
+                        .next()
+                })?;
+            let evidence = if known_ar {
+                "active_query"
+            } else {
+                "active_query_unindexed_parent"
+            };
             let query = query_class(index, find).unwrap_or_else(|| ACTIVE_QUERY.to_owned());
             let mut member = member(
                 &model.qualified_name,
@@ -1258,7 +1352,7 @@ fn query_members(index: &Index, nodes: &[Node], options: &AnalysisOptions) -> Ve
                 json!({
                     "framework_return_type": format!("{query}<{}>", model.qualified_name),
                     "exact_return": true,
-                    "framework_evidence": "active_query",
+                    "framework_evidence": evidence,
                     "implemented_by": find.id,
                 }),
             );

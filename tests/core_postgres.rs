@@ -457,3 +457,101 @@ fn postgres_search_keeps_only_included_paths() {
     r.delete_nodes(&[partner.id, admin.id]).unwrap();
     r.commit().unwrap();
 }
+
+#[test]
+#[ignore = "requires ATLAS_TEST_DATABASE_URL pointing to a disposable PostgreSQL database"]
+fn postgres_class_method_search_works_in_every_mode() {
+    // Benchmark: symbol search for `UserBonus::closeBonus` ended in "Storage operation failed".
+    let mut r = connection();
+    let prefix = unique();
+    let class = format!("Bonus_{}", prefix.replace('-', "_"));
+    let path = format!("{prefix}.php");
+    let make = |id: &str, kind: &str, name: &str, owner: &str, metadata: serde_json::Value| {
+        let mut n = node(id, &path);
+        n.kind = kind.into();
+        n.name = name.into();
+        n.qualified_name = if kind == "method" {
+            format!("common\\models\\{owner}::{name}")
+        } else {
+            String::new()
+        };
+        n.metadata = metadata;
+        n
+    };
+    let declaration = make(
+        &format!("{prefix}-decl"),
+        "method",
+        "closeBonus",
+        &class,
+        json!({}),
+    );
+    let other_declaration = make(
+        &format!("{prefix}-other-decl"),
+        "method",
+        "closeBonus",
+        "BonusCodLog",
+        json!({}),
+    );
+    let call = make(
+        &format!("{prefix}-call"),
+        "call_site",
+        "$bonus->closeBonus()",
+        &class,
+        json!({"member_name":"closeBonus","receiver_class":format!("common\\models\\{class}")}),
+    );
+    let other_call = make(
+        &format!("{prefix}-other-call"),
+        "call_site",
+        "$cod->closeBonus()",
+        "BonusCodLog",
+        json!({"member_name":"closeBonus","receiver_class":"common\\models\\BonusCodLog"}),
+    );
+    let stored = [
+        declaration.clone(),
+        other_declaration,
+        call.clone(),
+        other_call,
+    ];
+    r.begin().unwrap();
+    r.put_nodes(&stored).unwrap();
+    r.commit().unwrap();
+    let ids = |r: &mut PostgresRepository, query: String, mode: SearchMode| {
+        let mut found: Vec<String> = r
+            .search_nodes(&NodeSearch {
+                text: query,
+                limit: 50,
+                mode,
+                ..NodeSearch::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        found.sort();
+        found
+    };
+    let mut both = vec![declaration.id.clone(), call.id.clone()];
+    both.sort();
+    for query in [
+        format!("{class}::closeBonus"),
+        format!("common\\models\\{class}::closeBonus"),
+        format!("{class}::closeBonus").to_lowercase(),
+    ] {
+        assert_eq!(
+            ids(&mut r, query.clone(), SearchMode::Symbol),
+            both,
+            "{query}"
+        );
+    }
+    for mode in [SearchMode::Text, SearchMode::Substring] {
+        assert_eq!(
+            ids(&mut r, format!("{class}::closeBonus"), mode),
+            std::slice::from_ref(&declaration.id),
+            "{mode:?}"
+        );
+    }
+    r.begin().unwrap();
+    r.delete_nodes(&stored.iter().map(|n| n.id.clone()).collect::<Vec<_>>())
+        .unwrap();
+    r.commit().unwrap();
+}

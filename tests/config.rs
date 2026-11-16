@@ -206,6 +206,10 @@ tests:
   paths: ["spec/*"]
 mcp:
   max_context_depth: 5
+logging:
+  file: .atlas/atlas.log
+  parse_errors: true
+  parse_skips: true
 "#,
     );
     let config = Config::from_map(&values).unwrap();
@@ -223,6 +227,22 @@ mcp:
         ["docker/data_ignore", "*/tests/_output/*"]
     );
     assert_eq!(config.read_excludes, ["docker/data_ignore"]);
+    assert!(config.logging.parse_errors && config.logging.parse_skips);
+    assert!(!config.logging.requests);
+    assert!(config
+        .logging
+        .file
+        .as_ref()
+        .is_some_and(|p| p.ends_with(".atlas/atlas.log")));
+}
+
+#[test]
+fn logging_requires_file_when_a_topic_is_on() {
+    let error = Config::from_map(&project_with_setup(
+        "version: 1\nlogging:\n  parse_errors: true\n",
+    ))
+    .unwrap_err();
+    assert!(error.contains("logging.file"), "{error}");
 }
 
 #[test]
@@ -304,4 +324,25 @@ areas:
         let error = Config::from_map(&project_with_setup(bad)).unwrap_err();
         assert!(error.contains("areas"), "{bad}: {error}");
     }
+}
+
+#[test]
+fn name_only_callers_are_omitted_unless_the_setup_lists_something_else() {
+    let omitted = |mcp: &str| {
+        Config::from_map(&project_with_setup(&format!("version: 1\n{mcp}")))
+            .unwrap()
+            .omit_resolutions
+    };
+    assert_eq!(omitted(""), ["name_only"], "default");
+    assert_eq!(omitted("mcp:\n  max_context_depth: 4\n"), ["name_only"]);
+    assert!(omitted("mcp:\n  omit_resolutions: []\n").is_empty());
+    assert_eq!(
+        omitted("mcp:\n  omit_resolutions: [unresolved]\n"),
+        ["unresolved"]
+    );
+    assert_eq!(
+        Config::from_map(&settings()).unwrap().omit_resolutions,
+        ["name_only"],
+        "no setup file"
+    );
 }

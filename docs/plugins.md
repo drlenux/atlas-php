@@ -33,7 +33,11 @@ flowchart LR
 | --- | --- |
 | `sql_site` | место SQL внутри метода |
 | `table` | `table:public.wallet` (схема по умолчанию `public`) |
-| `sql_reads` / `sql_writes` | от `sql_site` к таблице (SELECT/FROM/JOIN → read; INSERT/UPDATE/DELETE/TRUNCATE → write) |
+| `sql_reads` / `sql_writes` | от `sql_site` к таблице (FROM/JOIN → read; INSERT/UPDATE/DELETE/TRUNCATE → write) и к колонкам (SELECT list → read; UPDATE SET / INSERT cols → write) |
+| `maps_table` | от ActiveRecord-класса к `table:…` (`tableName()` или camel2id имени класса) |
+| `maps_column` | `property:Model::$attr` → `column:…` (`rules` / `behaviors` / `attributeLabels` / `scenarios` / DDL) |
+| `contains` (controller→view) | view принадлежит контроллеру; nested render во view и `layout` тоже |
+| attr R/W | `load`, `attributes['f']`, ArrayAccess, QB `where`/`select`/`batchInsert` → `write_site`/`read_site` |
 
 CTE-имена (`WITH cte AS …`) не считаются таблицами. SQL не исполняется; динамическая конкатенация без литерала в аргументе API не разбирается.
 
@@ -56,6 +60,6 @@ CTE-имена (`WITH cte AS …`) не считаются таблицами. S
 
 ## Границы
 
-Статические объявления и доказуемые связи отделяются от кандидатов. Yii2 не исполняет bootstrap, DI-контейнер, closures конфигурации или динамические behaviors. Источник сведений из vendor включается через `index.include_vendor`. Нативный PHP-разбор имеет явно ограниченную область поддержки; SQL-outline покрывает типичный DML/DDL PostgreSQL, а не полную грамматику. Результаты новых тестов и ограничения переноса записываются в отчёте проверки.
+Статические объявления и доказуемые связи отделяются от кандидатов. Yii2 не исполняет bootstrap, DI-контейнер, closures конфигурации или динамические behaviors. Источник сведений из vendor включается через `index.include_vendor` и `index.declaration_paths` (по умолчанию часто только `vendor/yiisoft`): модели, наследующие базу вне этих путей, всё же получают `X::find()` → `ActiveQuery<X>`, но прочие унаследованные члены без индексированного предка не видны. В `switch` каждый `case`/`default` — отдельная точка входа: `return`/`break` в одной ветке не помечает следующие как `unreachable_after_exit`. Нативный PHP-разбор имеет явно ограниченную область поддержки; SQL-outline покрывает типичный DML/DDL PostgreSQL, а не полную грамматику. Результаты новых тестов и ограничения переноса записываются в отчёте проверки.
 
 Текущие сценарии и границы: [нативный PHP](testing-native-php.md), [pgsql / SQL-in-PHP](testing-native-pgsql.md), [Yii2](native-yii2.md), [runtime и реестр](testing-native-runtime.md).

@@ -3,7 +3,7 @@ mod query;
 mod syntax;
 pub mod tokens;
 
-pub use query::{looks_like_sql, outline, Effect, SqlOutline, TableRef};
+pub use query::{looks_like_sql, outline, ColumnRef, Effect, SqlOutline, TableRef};
 
 use crate::{
     analyzer::{AnalysisOptions, LanguagePlugin, SourceFile},
@@ -30,6 +30,25 @@ impl LanguagePlugin for PgsqlLanguagePlugin {
         let mut nodes = BTreeMap::new();
         let mut edges = BTreeMap::new();
         let mut diagnostics = Vec::new();
+        // declaration_paths (e.g. vendor/yiisoft) are PHP API surfaces, not project DDL.
+        // Yii ships schema-sqlite.sql / schema-mysql.sql there — indexing them pollutes
+        // table:/index: IDs and trips publish when statement errors mark the file failed.
+        let files: Vec<_> = files
+            .iter()
+            .filter(|file| {
+                if options.declaration_only(&file.path) {
+                    options.log.parse_skip(
+                        &file.path,
+                        0,
+                        "declaration_only",
+                        "SQL file skipped: path is under index.declaration_paths",
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
         options
             .progress
             .phase("analysis", "pgsql_parse", Some(files.len()), "files");
@@ -73,6 +92,7 @@ pub fn embed_sql(
     }
     let parsed = outline(sql).unwrap_or_else(|_| SqlOutline {
         tables: Vec::new(),
+        columns: Vec::new(),
         operation: None,
     });
     let mut nodes = BTreeMap::new();
@@ -84,10 +104,7 @@ pub fn embed_sql(
         Node {
             id: site_id.clone(),
             kind: "sql_site".into(),
-            name: parsed
-                .operation
-                .clone()
-                .unwrap_or_else(|| "sql".into()),
+            name: parsed.operation.clone().unwrap_or_else(|| "sql".into()),
             qualified_name: site_id.clone(),
             span: crate::domain::SourceSpan {
                 path: path.into(),
@@ -152,6 +169,44 @@ pub fn embed_sql(
                     "resolution": "resolved",
                     "table": table.qualified(),
                     "effect": match table.effect {
+                        Effect::Read => "read",
+                        Effect::Write => "write",
+                    }
+                }),
+                trust: 1,
+                revision: 0,
+            },
+        );
+    }
+    // Field-level R/W: SELECT list → sql_reads column; UPDATE SET / INSERT cols → sql_writes.
+    for column in &parsed.columns {
+        ensure_column(column, path, start_line, options, &mut nodes, &mut edges)?;
+        let kind = match column.effect {
+            Effect::Read => "sql_reads",
+            Effect::Write => "sql_writes",
+        };
+        let edge_id = format!(
+            "edge:{}",
+            tokens::fingerprint([kind, &site_id, &column.id(), &fp])
+        );
+        edges.insert(
+            edge_id.clone(),
+            Edge {
+                id: edge_id,
+                kind: kind.into(),
+                from: site_id.clone(),
+                to: Some(column.id()),
+                span: crate::domain::SourceSpan {
+                    path: path.into(),
+                    start_line,
+                    end_line,
+                },
+                metadata: json!({
+                    "fingerprint": fp,
+                    "resolution": "resolved",
+                    "table": column.qualified_table(),
+                    "column": column.name,
+                    "effect": match column.effect {
                         Effect::Read => "read",
                         Effect::Write => "write",
                     }
@@ -404,6 +459,74 @@ fn ensure_schema(
             revision: 0,
         },
     );
+    Ok(())
+}
+
+fn ensure_column(
+    column: &ColumnRef,
+    path: &str,
+    line: usize,
+    options: &AnalysisOptions,
+    nodes: &mut BTreeMap<String, Node>,
+    edges: &mut BTreeMap<String, Edge>,
+) -> Result<(), String> {
+    let table = TableRef {
+        schema: column.schema.clone(),
+        name: column.table.clone(),
+        effect: column.effect,
+    };
+    ensure_table(&table, path, line, options, nodes, edges)?;
+    let column_id = column.id();
+    if !nodes.contains_key(&column_id) {
+        nodes.insert(
+            column_id.clone(),
+            Node {
+                id: column_id.clone(),
+                kind: "column".into(),
+                name: column.name.clone(),
+                qualified_name: format!("{}.{}", column.qualified_table(), column.name),
+                span: crate::domain::SourceSpan {
+                    path: path.into(),
+                    start_line: line,
+                    end_line: line,
+                },
+                metadata: json!({
+                    "fingerprint": tokens::fingerprint([&column.id()]),
+                    "schema": column.schema,
+                    "table": column.table,
+                    "commented": false
+                }),
+                trust: 1,
+                revision: 0,
+            },
+        );
+        let table_id = table.id();
+        let edge_id = format!(
+            "edge:{}",
+            tokens::fingerprint(["contains", &table_id, &column_id, ""])
+        );
+        edges.insert(
+            edge_id.clone(),
+            Edge {
+                id: edge_id,
+                kind: "contains".into(),
+                from: table_id,
+                to: Some(column_id),
+                span: crate::domain::SourceSpan {
+                    path: path.into(),
+                    start_line: line,
+                    end_line: line,
+                },
+                metadata: json!({
+                    "fingerprint": tokens::fingerprint([&column.id()]),
+                    "resolution": "resolved"
+                }),
+                trust: 1,
+                revision: 0,
+            },
+        );
+    }
+    options.check(nodes.len() + edges.len())?;
     Ok(())
 }
 

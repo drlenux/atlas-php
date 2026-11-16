@@ -1,0 +1,51 @@
+{
+  "mode": "atlas",
+  "run": 5,
+  "exit": 0,
+  "elapsed_s": 407.8,
+  "cost_usd": 1.9338587999999999,
+  "usage": {
+    "input_tokens": 32,
+    "cache_creation_input_tokens": 115309,
+    "cache_read_input_tokens": 1248694,
+    "output_tokens": 38076,
+    "output_tokens_details": {
+      "thinking_tokens": 25545
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 115309,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "global",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 15177,
+        "cache_read_input_tokens": 139587,
+        "cache_creation_input_tokens": 2281,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 2281
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard",
+    "fallback_credit": null
+  },
+  "tool_calls": 15,
+  "atlas_calls": 13,
+  "atlas_share": 0.8666666666666667,
+  "must_find": {
+    "api_bonus_type": true,
+    "bgp_is_ended": true,
+    "create_freespin_bind_loop": true
+  },
+  "answer_head": "Расследование закончено, код не менял. Сам симптом с прода неизвестен, поэтому ниже кандидаты, отсортированные по вероятности. Первые два с высокой уверенностью приводят к прямой потере денег, игрока или казино.\n\n## 1. Как устроен MaxWin для фриспинов\n\n**Хранение:** таблица `max_win_user_bonus` (`common/models/MaxWinUserBonus.php:35`). Поля: `max_win`, `left_until_max_amount`, `active`, `finish`, `user_bonus_id`, `freespin_id`, `game_id`. Лимит задаётся на `Bonus` или `BonusCod` (`maxWinSettingB",
+  "stream": "atlas_5.jsonl"
+}

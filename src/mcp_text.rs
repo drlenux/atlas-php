@@ -39,6 +39,182 @@ pub fn without_index(text: &str) -> &str {
     }
 }
 
+/// Drop body lines whose resolution bracket lists any of `omit` (e.g. `unresolved`,
+/// or `name_only` for `[unresolved: name only]` guesses). A dropped callers-tree line
+/// takes its subtree along; the drop is stated as `# omitted token=N` so that an
+/// empty `called_by` is not mistaken for "no callers". Empty `omit` is a no-op.
+pub fn omit_resolutions(text: &str, omit: &[String]) -> String {
+    if omit.is_empty() {
+        return text.to_owned();
+    }
+    let omit: Vec<String> = omit.iter().map(|s| s.to_ascii_lowercase()).collect();
+    let mut kept = Vec::new();
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    // Tree depth of the last dropped line: deeper lines belong to it.
+    let mut dropped_depth: Option<usize> = None;
+    for line in text.lines() {
+        let depth = tree_depth(line);
+        if let (Some(dropped), Some(depth)) = (dropped_depth, depth) {
+            if depth > dropped {
+                continue;
+            }
+        }
+        dropped_depth = None;
+        match line_omitted_token(line, &omit) {
+            Some(token) if !line.starts_with('#') => {
+                *counts.entry(token).or_default() += 1;
+                dropped_depth = depth;
+            }
+            _ => kept.push(line.to_owned()),
+        }
+    }
+    if !counts.is_empty() {
+        let weak = counts.contains_key("name_only") || counts.contains_key("unresolved");
+        let omitted_n = counts.values().sum::<usize>();
+        state_emptied_sections(&mut kept, weak, omitted_n);
+        let summary: Vec<String> = counts.iter().map(|(t, n)| format!("{t}={n}")).collect();
+        kept.push(format!("# omitted {}", summary.join(" ")));
+    }
+    kept.join("\n")
+}
+
+/// An outline section whose items were all dropped (`called_by (excluded.tests=1):`)
+/// reads `called_by: none […]`, the form used for sections without items.
+fn state_emptied_sections(lines: &mut [String], weak_from_omit: bool, omitted_n: usize) {
+    for index in 0..lines.len() {
+        let next_is_item = lines
+            .get(index + 1)
+            .is_some_and(|next| next.starts_with(' '));
+        let line = &lines[index];
+        let Some(header) = line.strip_suffix(':') else {
+            continue;
+        };
+        let (name, notes) = header
+            .split_once(" (")
+            .map_or((header, ""), |(name, notes)| (name, notes));
+        let is_section =
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+        if next_is_item || !is_section {
+            continue;
+        }
+        lines[index] = if name == "called_by" {
+            let excluded = notes
+                .split(',')
+                .find_map(|part| {
+                    part.trim()
+                        .strip_prefix("excluded.tests=")
+                        .and_then(|n| n.trim_end_matches(')').parse().ok())
+                })
+                .unwrap_or(0);
+            let mut name_only_n = notes
+                .split(',')
+                .find_map(|part| {
+                    part.trim()
+                        .strip_prefix("possible.name_only=")
+                        .and_then(|n| n.trim_end_matches(')').parse().ok())
+                })
+                .unwrap_or(0);
+            if weak_from_omit {
+                name_only_n = name_only_n.max(omitted_n.max(1));
+            }
+            called_by_none_line(excluded, name_only_n)
+        } else if notes.is_empty() {
+            format!("{name}: none")
+        } else {
+            format!("{name}: none ({notes}")
+        };
+    }
+}
+
+/// Notes on a non-empty `called_by:` header (excluded tests / name-only guesses).
+fn called_by_notes(excluded_tests: usize, name_only_callers: usize) -> String {
+    let mut notes = Vec::new();
+    if excluded_tests > 0 {
+        notes.push(format!("excluded.tests={excluded_tests}"));
+    }
+    if name_only_callers > 0 {
+        notes.push(format!("possible.name_only={name_only_callers}"));
+    }
+    if notes.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", notes.join(", "))
+    }
+}
+
+/// Empty `called_by` always states how strong the absence claim is (cycle-2 proof).
+/// `proof=complete` = no resolved callers and no name-only residue in the graph.
+/// `proof=weak` = name-only / dynamic residue; agent must confirm with `atlas_grep`.
+fn called_by_none_line(excluded_tests: usize, name_only_callers: usize) -> String {
+    let mut notes = Vec::new();
+    if excluded_tests > 0 {
+        notes.push(format!("excluded.tests={excluded_tests}"));
+    }
+    if name_only_callers > 0 {
+        notes.push(format!("possible.name_only={name_only_callers}"));
+        notes.push("confirm with atlas_grep word:<method>".into());
+    }
+    let proof = if name_only_callers > 0 {
+        "weak"
+    } else {
+        "complete"
+    };
+    if notes.is_empty() {
+        format!("called_by: none [proof={proof}]")
+    } else {
+        format!("called_by: none [proof={proof}] ({})", notes.join(", "))
+    }
+}
+
+/// Characters before the `├ `/`└ ` branch of a callers-tree line, `None` for other lines.
+fn tree_depth(line: &str) -> Option<usize> {
+    let depth = line.chars().take_while(|c| matches!(c, '│' | ' ')).count();
+    line.chars()
+        .nth(depth)
+        .filter(|c| matches!(c, '├' | '└'))
+        .map(|_| depth)
+}
+
+/// The first requested token the line's resolution bracket carries, if any.
+fn line_omitted_token<'a>(line: &str, omit: &'a [String]) -> Option<&'a str> {
+    // Resolutions appear as `[resolved]` or `[annotated, candidate]` after the kind/name.
+    // Area labels look like `[partner] ` right after the location — skip those.
+    let known = [
+        "resolved",
+        "annotated",
+        "candidate",
+        "unresolved",
+        "external",
+    ];
+    let mut rest = line;
+    while let Some(start) = rest.find('[') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find(']') else {
+            break;
+        };
+        let tokens: Vec<String> = after[..end]
+            .split(',')
+            .flat_map(|part| resolution_tokens(part.trim()))
+            .collect();
+        if tokens.iter().any(|t| known.contains(&t.as_str())) {
+            if let Some(hit) = omit.iter().find(|o| tokens.contains(o)) {
+                return Some(hit);
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    None
+}
+
+/// `unresolved: name only` counts as both `unresolved` and `name_only`.
+fn resolution_tokens(part: &str) -> Vec<String> {
+    let part = part.to_ascii_lowercase();
+    match part.split_once(':') {
+        Some((kind, detail)) => vec![kind.trim().to_owned(), detail.trim().replace(' ', "_")],
+        None => vec![part],
+    }
+}
+
 /// `path:start[-end]: kind name [resolution] if(cond)… key=value… [qn=…] | id=… [rev=…] [trust=…]`
 pub fn node_line(node: &Node) -> String {
     // Occurrence names are the first line of their expression: show the whole
@@ -172,6 +348,17 @@ pub fn callers(freshness: &Freshness, tree: &CallerTree) -> String {
     if tree.name_only_callers > 0 {
         let _ = write!(header, " possible.name_only={}", tree.name_only_callers);
     }
+    if tree.children.is_empty() {
+        let proof = if tree.name_only_callers > 0 {
+            "weak"
+        } else {
+            "complete"
+        };
+        let _ = write!(header, " called_by=none [proof={proof}]");
+        if tree.name_only_callers > 0 {
+            header.push_str(" confirm_with=atlas_grep");
+        }
+    }
     if tree.members_without_usages > 0 {
         let _ = write!(
             header,
@@ -218,6 +405,12 @@ fn caller_line(node: &CallerNode) -> String {
     if !node.resolutions.is_empty() {
         let _ = write!(line, " [{}]", node.resolutions.join(", "));
     }
+    if !node.guards.is_empty() {
+        let _ = write!(line, " guards:[{}]", node.guards.join(", "));
+    }
+    if !node.missing.is_empty() {
+        let _ = write!(line, " missing:[{}]", node.missing.join(", "));
+    }
     // The innermost conditions are the ones that guard the call; outer ones are elided.
     let shown = node.conditions.len().saturating_sub(TREE_CONDITIONS);
     if shown > 0 {
@@ -226,7 +419,8 @@ fn caller_line(node: &CallerNode) -> String {
     for condition in &node.conditions[shown..] {
         let _ = write!(line, " if({})", short(&collapse(condition)));
     }
-    let _ = write!(line, ": {}", short(&collapse(&node.expression)));
+    // The service already bounds the expression, keeping argument names (see `site_expression`).
+    let _ = write!(line, ": {}", collapse(&node.expression));
     if let Some(note) = &node.note {
         let _ = write!(line, " ({note})");
     }
@@ -254,7 +448,45 @@ pub fn grep(freshness: &Freshness, page: &GrepPage) -> String {
     lines.join("\n")
 }
 
+/// Agent outline text (magic members folded; see `fold_magic_members`).
 pub fn outline(freshness: &Freshness, outline: &Outline) -> String {
+    render_outline(freshness, outline, true)
+}
+
+/// Outline text with every member on its own line (explicit `sections:["members"]`).
+pub fn outline_expanded(freshness: &Freshness, outline: &Outline) -> String {
+    render_outline(freshness, outline, false)
+}
+
+/// Real members stay one per line; magic ones (`[magic…]` flag: PHPDoc `@property`,
+/// AR columns, framework members) become one `magic (N): a, b, …` summary line.
+fn fold_magic_members(members: &[String]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut magic = Vec::new();
+    for member in members {
+        match magic_declaration(member) {
+            Some(declaration) => magic.push(declaration),
+            None => lines.push(member.clone()),
+        }
+    }
+    if !magic.is_empty() {
+        lines.push(format!("magic ({}): {}", magic.len(), magic.join(", ")));
+    }
+    lines
+}
+
+/// `$tax: float` from `L2 property $tax: float [magic, annotation]`; `None` when not magic.
+fn magic_declaration(member: &str) -> Option<String> {
+    let (declaration, flags) = member.strip_suffix(']')?.rsplit_once(" [")?;
+    if !flags.split(", ").any(|flag| flag == "magic") {
+        return None;
+    }
+    let mut words = declaration.splitn(3, ' ');
+    let (line, _kind, rest) = (words.next()?, words.next()?, words.next()?);
+    line.starts_with('L').then(|| rest.to_owned())
+}
+
+fn render_outline(freshness: &Freshness, outline: &Outline, fold_magic: bool) -> String {
     let mut lines = vec![
         index_line(freshness),
         format!(
@@ -282,26 +514,29 @@ pub fn outline(freshness: &Freshness, outline: &Outline) -> String {
     ] {
         // Left-out test callers are stated on the section line.
         let excluded = if name == "called_by" {
-            let mut notes = Vec::new();
-            if outline.excluded_tests > 0 {
-                notes.push(format!("excluded.tests={}", outline.excluded_tests));
-            }
-            if outline.name_only_callers > 0 {
-                notes.push(format!("possible.name_only={}", outline.name_only_callers));
-            }
-            if notes.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", notes.join(", "))
-            }
+            called_by_notes(outline.excluded_tests, outline.name_only_callers)
         } else {
             String::new()
         };
         if !items.is_empty() {
             lines.push(format!("{name}{excluded}:"));
+            let folded;
+            let items = if fold_magic && name == "members" {
+                folded = fold_magic_members(items);
+                &folded
+            } else {
+                items
+            };
             lines.extend(items.iter().map(|item| format!("  {}", collapse(item))));
         } else if stated_none(name) {
-            lines.push(format!("{name}: none{excluded}"));
+            if name == "called_by" {
+                lines.push(called_by_none_line(
+                    outline.excluded_tests,
+                    outline.name_only_callers,
+                ));
+            } else {
+                lines.push(format!("{name}: none{excluded}"));
+            }
         }
     }
     lines.join("\n")
@@ -316,6 +551,13 @@ pub fn read(freshness: &Freshness, slice: &SourceSlice) -> String {
             slice.path, slice.start_line, slice.end_line
         ),
     ];
+    // Spec file:line drifts: show which declaration the anchor actually sits in.
+    if let Some(enc) = &slice.enclosing {
+        lines.push(format!(
+            "# in: {} {} {}:{}-{} | id={}",
+            enc.kind, enc.name, slice.path, enc.start_line, enc.end_line, enc.id
+        ));
+    }
     lines.extend(
         slice
             .lines
@@ -949,6 +1191,8 @@ mod tests {
             lines,
             resolutions: vec!["resolved".into()],
             conditions: vec!["$ok".into()],
+            guards: vec!["if($locked) return".into()],
+            missing: vec![],
             expression: "$x->run(\n  1\n)".into(),
             children,
             note: None,
@@ -976,9 +1220,9 @@ mod tests {
             [
                 "# callers method:A::a levels=3 complete excluded.tests=2",
                 "A::a src/A.php:3",
-                "├ B::b L20 [resolved] if($ok): $x->run( 1 )",
-                "│ └ C::c L10 L12 [resolved] if($ok): $x->run( 1 )",
-                "└ R::r L4 [resolved] if($ok): $x->run( 1 ) (recursion)",
+                "├ B::b L20 [resolved] guards:[if($locked) return] if($ok): $x->run( 1 )",
+                "│ └ C::c L10 L12 [resolved] guards:[if($locked) return] if($ok): $x->run( 1 )",
+                "└ R::r L4 [resolved] guards:[if($locked) return] if($ok): $x->run( 1 ) (recursion)",
             ]
         );
     }
@@ -1040,7 +1284,7 @@ mod tests {
                 "owner: none",
                 "overridden_by:",
                 "  method:A::run",
-                "called_by: none",
+                "called_by: none [proof=complete]",
             ]
         );
     }
@@ -1060,7 +1304,7 @@ mod tests {
         };
         assert_eq!(
             outline_text_lines(&outline)[1],
-            "called_by: none (excluded.tests=1, possible.name_only=12)"
+            "called_by: none [proof=weak] (excluded.tests=1, possible.name_only=12, confirm with atlas_grep word:<method>)"
         );
         let tree = CallerTree {
             root_id: "method:P::save".into(),
@@ -1073,7 +1317,24 @@ mod tests {
         };
         assert_eq!(
             callers(&fresh(), &tree).lines().nth(1).unwrap(),
-            "# callers method:P::save levels=1 complete possible.name_only=12"
+            "# callers method:P::save levels=1 complete possible.name_only=12 called_by=none [proof=weak] confirm_with=atlas_grep"
+        );
+    }
+
+    #[test]
+    fn empty_called_by_without_residue_is_proof_complete() {
+        let outline = Outline {
+            id: "method:Dead::run".into(),
+            kind: "method".into(),
+            name: "Dead::run".into(),
+            path: "a.php".into(),
+            line: 1,
+            none: vec!["called_by".into()],
+            ..Outline::default()
+        };
+        assert_eq!(
+            outline_text_lines(&outline)[1],
+            "called_by: none [proof=complete]"
         );
     }
 
@@ -1093,6 +1354,7 @@ mod tests {
             end_line: 5,
             lines: vec!["function pay() {".into(), "}".into()],
             truncated: false,
+            enclosing: None,
         };
         let text = read(&fresh(), &slice);
         assert_eq!(

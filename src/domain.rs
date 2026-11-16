@@ -351,6 +351,10 @@ pub struct CallerNode {
     pub resolutions: Vec<String>,
     /// Branch conditions of the first site, outermost first.
     pub conditions: Vec<String>,
+    /// Nearest early-exit guards of the caller before the first site (`if(cond) return`).
+    pub guards: Vec<String>,
+    /// Callee parameters not passed by at least one of the caller's sites.
+    pub missing: Vec<String>,
     pub expression: String,
     pub children: Vec<CallerNode>,
     /// `recursion` when the caller is already on the path from the root.

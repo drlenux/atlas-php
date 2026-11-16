@@ -43,6 +43,12 @@ pub struct Config {
     pub agent_token: String,
     pub review_token: String,
     pub allowed_origins: Vec<String>,
+    /// File logging from `.atlas/setup.yaml` `logging` (disabled without the file).
+    pub logging: crate::logging::LoggingConfig,
+    /// Optional bash post-processor for MCP tool text.
+    pub mcp_hook: crate::mcp_hook::McpHook,
+    /// Drop MCP lines with these `[resolution]` values.
+    pub omit_resolutions: Vec<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -55,6 +61,9 @@ impl std::fmt::Debug for Config {
             .finish_non_exhaustive()
     }
 }
+
+/// Agent text hides name-only caller guesses unless `mcp.omit_resolutions` says otherwise.
+pub const DEFAULT_OMIT_RESOLUTIONS: [&str; 1] = ["name_only"];
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
@@ -82,11 +91,16 @@ impl Config {
         }
         let mut merged = values.clone();
         merged.extend(setup.settings());
-        let mut config = Self::from_settings(&merged, project_root)
+        let mut config = Self::from_settings(&merged, project_root.clone())
             .map_err(|error| crate::setup::rename_keys(&error))?;
         config.grep_excludes = setup.grep_excludes();
         config.read_excludes = setup.exclude.clone();
         config.areas = setup.areas()?;
+        config.logging = setup.logging(&project_root)?;
+        config.mcp_hook = setup.mcp_hook(&project_root)?;
+        if let Some(omit) = &setup.mcp.omit_resolutions {
+            config.omit_resolutions = omit.clone();
+        }
         Ok(config)
     }
 
@@ -210,7 +224,8 @@ impl Config {
             // Finer occurrence/branch nodes need headroom on mid-size PHP trees.
             max_graph_elements: env.number("ATLAS_MAX_GRAPH_ELEMENTS", 2_000_000, 1, 20_000_000)?
                 as usize,
-            analysis_timeout_secs: env.number("ATLAS_ANALYSIS_TIMEOUT_SECS", 120, 1, 3600)?,
+            // Large PHP/Yii trees with 1 worker need ~10 min; 120 s aborted full Slotor passes.
+            analysis_timeout_secs: env.number("ATLAS_ANALYSIS_TIMEOUT_SECS", 900, 1, 3600)?,
             cpu_limit,
             index_workers,
             memory_limit_mb: env.number("ATLAS_MEMORY_LIMIT_MB", 1024, 64, 1_048_576)?,
@@ -221,6 +236,9 @@ impl Config {
             agent_token,
             review_token,
             allowed_origins: origins,
+            logging: crate::logging::LoggingConfig::default(),
+            mcp_hook: crate::mcp_hook::McpHook::default(),
+            omit_resolutions: DEFAULT_OMIT_RESOLUTIONS.map(str::to_owned).to_vec(),
         })
     }
 }

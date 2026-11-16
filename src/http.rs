@@ -4,7 +4,7 @@ use crate::{
         NodeSearch, SearchMode, SearchPage,
     },
     grep_search::{GrepOutput, GrepPage, GrepRequest},
-    mcp_text,
+    mcp_text, panic_guard,
     project::SourceWalk,
     service::{AtlasService, SupplementRequest},
 };
@@ -29,6 +29,9 @@ use std::{
 };
 
 pub const MCP_VERSION: &str = "2025-11-25";
+
+/// Sent on `initialize`: the only guidance a client has when the project ships no CLAUDE.md/skill.
+const MCP_INSTRUCTIONS: &str = "Code Atlas is the code graph of this PHP/Yii2 project. USE IT FIRST, instead of shell grep/rg/sed/find and instead of reading whole *.php files: atlas_search finds a symbol, atlas_outline shows a class/method (members, calls, called_by), atlas_grep is full-text search over live sources, atlas_read reads a narrow slice. Call Atlas before shell grep for any PHP question: who calls X, where a field is written, which SQL/view touches it, where a REQ-ID or string is. Shell grep stays for JS/CSS/translations/git history only.\nCallers: atlas_outline sections:[\"called_by\"] lists every direct caller with call arguments (expression) and guards:[...] (nearest early-exit checks before the call). Read each caller across all areas with atlas_read: the graph shows the call, not the neighbouring checks in the same action. Empty called_by is not proof of unused code: confirm with atlas_grep. atlas_context direction in = callers tree.\nResults are grep-style text, not JSON. Lines may carry an [area] label (application folder from .atlas/setup.yaml); area:\"admin\" limits search, grep, outline callers and callers trees. atlas_batch runs up to 10 read-only calls at once (each call needs arguments:{...}). atlas_search withGrep adds source lines atlas missed. Tests are excluded unless include_tests. Graph resolution is not proof of unused code. Returned context is measured as delivery, not actual agent usage.";
 static DELIVERY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -59,6 +62,12 @@ pub struct HttpConfig {
     pub read_excludes: Vec<String>,
     /// Application folders (`area` argument).
     pub areas: Vec<crate::domain::Area>,
+    /// Optional project file log for MCP request/response traffic.
+    pub log: crate::logging::AtlasLog,
+    /// Optional bash post-processor for tool text (`mcp.response_script`).
+    pub mcp_hook: crate::mcp_hook::McpHook,
+    /// Drop tool-text lines with these `[resolution]` tokens.
+    pub omit_resolutions: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -70,10 +79,7 @@ struct HttpState {
 
 /// Transport adapters deliberately delegate every use case to AtlasService.
 pub fn router(service: Arc<Mutex<AtlasService>>, config: HttpConfig) -> Router {
-    let progress = service
-        .lock()
-        .expect("service available during router setup")
-        .indexing_progress();
+    let progress = panic_guard::lock(&service).indexing_progress();
     let state = HttpState {
         service,
         config,
@@ -126,7 +132,14 @@ pub fn router(service: Arc<Mutex<AtlasService>>, config: HttpConfig) -> Router {
         )
         .route(
             "/health",
-            get(|| async { Json(json!({"status":"ok","service":"code-atlas"})) }),
+            get(|| async {
+                // `panics`: requests whose panic was contained (see panic_guard).
+                Json(json!({
+                    "status":"ok",
+                    "service":"code-atlas",
+                    "panics":panic_guard::caught()
+                }))
+            }),
         )
         .route(
             "/assets/explore.mjs",
@@ -154,6 +167,7 @@ pub fn router(service: Arc<Mutex<AtlasService>>, config: HttpConfig) -> Router {
         .route("/api/reviews/:id/decision", post(review_decision))
         .route("/api/analytics", get(analytics))
         .route("/api/indexing", get(indexing))
+        .route("/api/meta", get(meta))
         .route("/api/reindex", post(reindex))
         .route("/api/atlas/reset", post(reset_atlas))
         .route("/api/search", get(search))
@@ -193,6 +207,21 @@ async fn reset_atlas(
         "reset": true,
         "reindex_queued": progress.snapshot().reindex_queued
     })))
+}
+
+/// Setup summary for the reviewer UI (areas, plugins, MCP output filters).
+async fn meta(State(state): State<HttpState>) -> Json<Value> {
+    let config = &state.config;
+    Json(json!({
+        "areas": config.areas.iter().map(|area| json!({
+            "id": area.prefix,
+            "paths": area.paths,
+            "shared": area.shared,
+        })).collect::<Vec<_>>(),
+        "languages": config.language_plugins,
+        "frameworks": config.framework_plugins,
+        "omit_resolutions": config.omit_resolutions,
+    }))
 }
 
 async fn indexing(State(state): State<HttpState>) -> Json<crate::progress::ProgressSnapshot> {
@@ -270,11 +299,10 @@ where
     F: FnOnce(&mut AtlasService) -> crate::domain::Result<T> + Send + 'static,
 {
     tokio::task::spawn_blocking(move || {
-        let mut service = state
-            .service
-            .lock()
-            .map_err(|_| AtlasError::storage("Service lock unavailable"))?;
-        action(&mut service)
+        let mut service = panic_guard::lock(&state.service);
+        // A panic ends this request only; the lock is released without poisoning.
+        panic_guard::run(|| action(&mut service))
+            .unwrap_or_else(|_| Err(AtlasError::storage("Service task failed")))
     })
     .await
     .map_err(|_| ApiError(AtlasError::storage("Service task failed")))?
@@ -384,6 +412,8 @@ struct SearchQuery {
     kinds: Option<String>,
     cursor: Option<String>,
     mode: Option<SearchMode>,
+    /// Comma-separated area prefixes from `.atlas/setup.yaml`.
+    area: Option<String>,
     #[serde(default, alias = "withGrep")]
     with_grep: bool,
     #[serde(
@@ -415,6 +445,25 @@ async fn search(
         }
     }
     let http_config = state.config.clone();
+    let area_names = query
+        .area
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let include_paths = match area_filter(&http_config, OneOrMany::Many(area_names)) {
+        Ok(paths) => paths,
+        Err(ToolError::Arguments(message)) => {
+            return Err(ApiError(AtlasError::invalid(message)));
+        }
+        Err(ToolError::Domain(error)) => return Err(ApiError(error)),
+    };
     let search = NodeSearch {
         text: query.q,
         kinds: query
@@ -427,7 +476,7 @@ async fn search(
         mode: query.mode.unwrap_or(SearchMode::Substring),
         // The reviewer sees tests; agent views leave them out by default.
         exclude_paths: None,
-        include_paths: None,
+        include_paths,
     };
     let value = service_call(state, move |service| {
         let page = service.search_page(&search, Detail::Summary)?;
@@ -574,6 +623,20 @@ pub enum RpcReply {
 }
 
 pub fn dispatch_rpc(service: &mut AtlasService, request: Value, config: &HttpConfig) -> RpcReply {
+    if config.log.requests_enabled() {
+        config.log.request("mcp", &request.to_string());
+    }
+    let reply = dispatch_rpc_body(service, request, config);
+    if config.log.responses_enabled() {
+        match &reply {
+            RpcReply::Response(value) => config.log.response("mcp", &value.to_string()),
+            RpcReply::Notification => config.log.response("mcp", "notification accepted"),
+        }
+    }
+    reply
+}
+
+fn dispatch_rpc_body(service: &mut AtlasService, request: Value, config: &HttpConfig) -> RpcReply {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let valid_id = id.is_string() || id.as_i64().is_some() || id.as_u64().is_some();
     let method = request.get("method").and_then(Value::as_str);
@@ -602,7 +665,7 @@ pub fn dispatch_rpc(service: &mut AtlasService, request: Value, config: &HttpCon
             {
                 return RpcReply::Response(rpc_error(id, -32602, "protocolVersion is required"));
             }
-            json!({"protocolVersion":MCP_VERSION,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"code-atlas","version":env!("CARGO_PKG_VERSION")},"instructions":"Results are grep-style text, not JSON. Lines may carry an [area] label (application folder from .atlas/setup.yaml); area:\"admin\" limits search, grep, outline callers and callers trees. atlas_batch runs up to 10 read-only calls at once. atlas_context direction in = callers tree (call levels); atlas_outline sections:[\"called_by\"] for direct callers; atlas_search (withGrep adds source lines atlas missed); atlas_grep full-text over every text file; atlas_read narrow slices. Tests are excluded unless include_tests. Graph resolution is not proof of unused code. Returned context is measured as delivery, not actual agent usage."})
+            json!({"protocolVersion":MCP_VERSION,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"code-atlas","version":env!("CARGO_PKG_VERSION")},"instructions":MCP_INSTRUCTIONS})
         }
         "ping" => json!({}),
         "tools/list" => json!({"tools":tool_definitions(config)}),
@@ -615,14 +678,20 @@ pub fn dispatch_rpc(service: &mut AtlasService, request: Value, config: &HttpCon
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            match call_tool(service, name, arguments, config) {
-                Ok(text) => tool_text(text),
-                Err(ToolError::Arguments(message)) => {
+            // A bug in one tool call must not end the process or poison the service lock.
+            let outcome = panic_guard::run(|| {
+                call_tool(service, name, arguments, config)
+                    .map(|text| finish_tool_text(config, name, text))
+            });
+            match outcome {
+                Ok(Ok(text)) => tool_text(text),
+                Ok(Err(ToolError::Arguments(message))) => {
                     return RpcReply::Response(rpc_error(id, -32602, &message))
                 }
-                Err(ToolError::Domain(error)) => {
-                    json!({"content":[{"type":"text","text":domain_message(error)}],"isError":true})
-                }
+                Ok(Err(ToolError::Domain(error))) => tool_error(domain_message(error)),
+                Err(_) => tool_error(format!(
+                    "Internal error in {name}; the request was aborted and the service keeps running"
+                )),
             }
         }
         _ => return RpcReply::Response(rpc_error(id, -32601, "Method not found")),
@@ -819,15 +888,8 @@ fn domain_message(error: AtlasError) -> String {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BatchArgs {
-    calls: Vec<BatchCall>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct BatchCall {
-    tool: String,
-    #[serde(default)]
-    arguments: Value,
+    /// Each item: `{tool, arguments}` or flat `{tool, entity_id, …}` (R6).
+    calls: Vec<Value>,
 }
 
 /// Calls per `atlas_batch` request.
@@ -840,6 +902,36 @@ const BATCH_TOOLS: [&str; 5] = [
     "atlas_grep",
     "atlas_read",
 ];
+
+/// Agents repeatedly put tool fields next to `tool` instead of under `arguments`
+/// (report_v3: third time). Accept both shapes.
+fn normalize_batch_call(call: Value) -> Result<(String, Value), ToolError> {
+    let obj = call
+        .as_object()
+        .ok_or_else(|| ToolError::Arguments("each atlas_batch call must be an object".into()))?;
+    let tool = obj
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ToolError::Arguments("atlas_batch call requires tool".into()))?
+        .to_owned();
+    let mut merged = serde_json::Map::new();
+    match obj.get("arguments") {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(map)) => merged.extend(map.clone()),
+        Some(_) => {
+            return Err(ToolError::Arguments(
+                "atlas_batch call.arguments must be an object".into(),
+            ));
+        }
+    }
+    for (key, value) in obj {
+        if key == "tool" || key == "arguments" {
+            continue;
+        }
+        merged.entry(key.clone()).or_insert(value.clone());
+    }
+    Ok((tool, Value::Object(merged)))
+}
 
 /// `atlas_batch`: each call runs through `call_tool` (same validation and analytics);
 /// one index line on top, then `## [n] tool` sections; a failing call becomes an
@@ -854,24 +946,40 @@ fn run_batch(
     let mut sections = Vec::new();
     for (index, call) in args.calls.into_iter().enumerate() {
         let n = index + 1;
-        let tool = call.tool;
-        let result = if !BATCH_TOOLS.contains(&tool.as_str()) {
-            Err(ToolError::Arguments(format!(
-                "{tool} is not allowed in atlas_batch (read-only tools: {})",
-                BATCH_TOOLS.join(", ")
-            )))
-        } else {
-            let arguments = if call.arguments.is_null() {
-                json!({})
-            } else {
-                call.arguments
-            };
-            call_tool(service, &tool, arguments, config)
+        let label = call
+            .get("tool")
+            .and_then(|v| v.as_str())
+            .unwrap_or("call")
+            .to_owned();
+        let result = match normalize_batch_call(call) {
+            Err(error) => Err((label, error)),
+            Ok((tool, arguments)) => {
+                if !BATCH_TOOLS.contains(&tool.as_str()) {
+                    Err((
+                        tool.clone(),
+                        ToolError::Arguments(format!(
+                            "{tool} is not allowed in atlas_batch (read-only tools: {})",
+                            BATCH_TOOLS.join(", ")
+                        )),
+                    ))
+                } else {
+                    match call_tool(service, &tool, arguments, config) {
+                        Ok(text) => Ok((tool, text)),
+                        Err(error) => Err((tool, error)),
+                    }
+                }
+            }
         };
         sections.push(match result {
-            Ok(text) => format!("## [{n}] {tool}\n{}", mcp_text::without_index(&text)),
-            Err(ToolError::Arguments(message)) => format!("## [{n}] {tool} error: {message}"),
-            Err(ToolError::Domain(error)) => {
+            Ok((tool, text)) => {
+                // Resolutions filtered here; response_script runs once on the batch result.
+                let text = mcp_text::omit_resolutions(&text, &config.omit_resolutions);
+                format!("## [{n}] {tool}\n{}", mcp_text::without_index(&text))
+            }
+            Err((tool, ToolError::Arguments(message))) => {
+                format!("## [{n}] {tool} error: {message}")
+            }
+            Err((tool, ToolError::Domain(error))) => {
                 format!("## [{n}] {tool} error: {}", domain_message(error))
             }
         });
@@ -883,6 +991,17 @@ fn run_batch(
 /// Successful tool result: one grep-style text block (see `mcp_text`).
 fn tool_text(text: String) -> Value {
     json!({"content":[{"type":"text","text":text}],"isError":false})
+}
+
+/// Failed tool result: the agent sees the text and `isError`, not a protocol error.
+fn tool_error(text: String) -> Value {
+    json!({"content":[{"type":"text","text":text}],"isError":true})
+}
+
+/// Drop omitted resolutions, then optional `mcp.response_script`.
+fn finish_tool_text(config: &HttpConfig, tool: &str, text: String) -> String {
+    let filtered = mcp_text::omit_resolutions(&text, &config.omit_resolutions);
+    crate::mcp_hook::process_tool_text(&config.mcp_hook, tool, filtered)
 }
 
 /// Runs one tool and returns its text result (see `mcp_text`).
@@ -977,7 +1096,12 @@ fn call_tool(
                 test_exclusion(config, args.include_tests).as_deref(),
                 area.as_deref(),
             )?;
-            let result = mcp_text::outline(&service.freshness()?, &outline);
+            // Magic members are folded unless the agent asks for the members section.
+            let result = if args.sections.iter().any(|s| s == "members") {
+                mcp_text::outline_expanded(&service.freshness()?, &outline)
+            } else {
+                mcp_text::outline(&service.freshness()?, &outline)
+            };
             // Count the opened entity and the graph edges/nodes the outline actually read.
             service.record_delivery(&delivery_id(), &nodes, &edges, now())?;
             Ok(result)
@@ -1200,12 +1324,12 @@ fn looks_like_grep_cursor(cursor: &str) -> bool {
 /// Graph paths plus filesystem discovery (configs with no nodes still need withGrep).
 fn tool_definitions(config: &HttpConfig) -> Vec<Value> {
     vec![
-        json!({"name":"atlas_search","description":"Find code entities by name, qualified name, occurrence expression or id. Text result: `# search nodes=N complete|next_cursor=C [tests=excluded]`, then one line per node: `path:line[-end]: kind name [resolution] if(condition)... key=value... | id=ID rev=N`. Ranked exact name > declarations > other > occurrence sites; pass next_cursor as cursor until complete. mode text = whole identifier (like grep -w), never inside string literals; substring = partial; symbol = exact declaration/member. Narrow with kinds (class, method, call_site, write_site, config_key...). Test code is left out unless include_tests. withGrep=true appends `# grep supplement`: source lines matching the same query that atlas did not return (comments, strings, configs, scripts); continue it with grepCursor.","inputSchema":{"type":"object","properties":{"area":{"type":["string","array"],"items":{"type":"string"},"description":"Only these areas (prefixes from .atlas/setup.yaml areas, e.g. partner, admin)"},"include_tests":{"type":"boolean","default":false,"description":"Keep code under ATLAS_TEST_PATHS (left out by default)"},"query":{"type":"string"},"kinds":{"type":"array","items":{"type":"string","pattern":"^[a-z0-9_]+$"},"minItems":1,"maxItems":20,"description":"Node kinds to keep (class, method, config_key, write_site, call_site, …). For withGrep, write_site/writes/magic_set/assignment also restrict grep to assignment-like lines."},"limit":{"type":"integer","minimum":1,"maximum":100,"default":20},"cursor":{"type":"string","description":"next_cursor from the previous node page (or path:line grep cursor when withGrep)"},"mode":{"type":"string","enum":["text","substring","symbol"],"default":"text","description":"text: whole identifier (like grep -w) in names and occurrence expressions; substring: partial match in the same fields; symbol: exact declaration/member/config_key match; withGrep uses word-boundary short name"},"withGrep":{"type":"boolean","default":false,"description":"Append literal grep hits missing from atlas results (scans watched source tree, not only paths already in the graph)"},"grepCursor":{"type":"string","description":"Continue truncated withGrep: pass grep.next_cursor / grep_next_cursor from the previous response"}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
-        json!({"name":"atlas_context","description":"Who calls / uses an entity, or its local graph. direction in (and the default for a class): callers tree `# callers ID levels=N complete|truncated [excluded.tests=N]`, root line, then `├`/`└` lines `Caller::method L12 L30 [resolved] if(cond): expression`; depth = call levels; a class lists its members used from outside, then their callers. direction both/out on a method: numbered nodes `[n] path:line: kind name ... | id=ID rev=N` and edges `[n] -kind-> [m] path:line ...` (edges omit what their source line already shows); declaration members are not listed (omitted_members; use atlas_outline). Test callers are left out unless include_tests. resolution: resolved = from code types; annotated = only via PHPDoc, verify; candidate = several targets; unresolved/external = unknown or outside the index.","inputSchema":{"type":"object","properties":{"area":{"type":["string","array"],"items":{"type":"string"},"description":"Only these areas (prefixes from .atlas/setup.yaml areas, e.g. partner, admin)"},"include_tests":{"type":"boolean","default":false,"description":"Keep code under ATLAS_TEST_PATHS (left out by default)"},"entity_id":{"type":"string"},"depth":{"type":"integer","minimum":0,"maximum":config.max_context_depth},"max_nodes":{"type":"integer","minimum":1,"maximum":config.max_context_nodes},"direction":{"type":"string","enum":["both","in","out"],"default":"both"},"detail":{"type":"string","enum":["summary","full"],"default":"summary"},"include_diagnostics":{"type":"boolean","default":false}},"required":["entity_id"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
-        json!({"name":"atlas_outline","description":"Compact structure of a class, interface, trait or method as text: header `kind name path:line | id=ID`, then sections (`called_by:`, `calls:`, `members:`, `parents:`, `overridden_by:`...) with one indented line each; a requested empty section prints `<section>: none`. Interface methods list implementations under overridden_by. Class members: `L<line> <kind> <name>(<params>): <type> [magic|annotation|framework]`. calls: `L<line> <expression> -> <target> [resolution]`; called_by: `<caller> L<line>: <expression> [resolution]` (test callers left out unless include_tests, counted as `called_by (excluded.tests=N):`). sections:[\"called_by\"] for callers only.","inputSchema":{"type":"object","properties":{"area":{"type":["string","array"],"items":{"type":"string"},"description":"Only these areas (prefixes from .atlas/setup.yaml areas, e.g. partner, admin)"},"include_tests":{"type":"boolean","default":false,"description":"Keep code under ATLAS_TEST_PATHS (left out by default)"},"entity_id":{"type":"string"},"sections":{"type":"array","items":{"type":"string","enum":["owner","parents","interfaces","traits","children","implementations","overrides","overridden_by","calls","called_by","members"]},"minItems":1,"maxItems":11,"description":"Keep only these outline fields; omit for the default lean method / full class outline. Use [\"called_by\"] when listing callers."}},"required":["entity_id"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
-        json!({"name":"atlas_grep","description":"Full-text search over live sources (PHP, configs, comments, templates), including files without graph nodes; prefer over shell rg. Literal or regex, case_sensitive, word (identifier boundaries), path_prefix, path_glob, include_vendor. Text result in ripgrep layout: `# grep hits=N scanned=F complete|next_cursor=C [incomplete] [excluded.<reason>=N]`, matches `path:line:col: text`, context `path-line- text`, files_with_matches one path per line, count `path:N`, `# skipped path reason`, `# error path: message`. Test code is left out unless include_tests; .git/.idea/.vscode are never scanned. No match lines and no `incomplete` means no match.","inputSchema":{"type":"object","properties":{"area":{"type":["string","array"],"items":{"type":"string"},"description":"Only these areas (prefixes from .atlas/setup.yaml areas, e.g. partner, admin)"},"include_tests":{"type":"boolean","default":false,"description":"Keep files under ATLAS_TEST_PATHS (left out by default, counted as excluded.tests)"},"query":{"type":"string","minLength":1},"regex":{"type":"boolean","default":false},"case_sensitive":{"type":"boolean","default":true},"word":{"type":"boolean","default":false},"path_prefix":{"type":"string"},"path_glob":{"type":["string","array"],"items":{"type":"string"},"description":"Glob(s) on the relative path: * ** ? [abc] [!abc] {a,b}; entries starting with ! exclude, e.g. [\"*.php\",\"!*/tests/*\"]"},"include_vendor":{"type":"boolean","default":false},"output":{"type":"string","enum":["content","files_with_matches","count"],"default":"content"},"context":{"type":"integer","minimum":0,"maximum":5,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50},"cursor":{"type":"string","description":"next_cursor from previous page (path:line)"}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
-        json!({"name":"atlas_read","description":"Read live source lines: path+start_line/end_line, around_line+context, or entity_id (graph span, current file text). Max 400 lines. Text result: `# path:start-end [truncated]`, then `line: text`. Use after atlas_grep/outline instead of external Read.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"entity_id":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"around_line":{"type":"integer","minimum":1},"context":{"type":"integer","minimum":0,"maximum":50,"default":20,"description":"Lines around around_line, or ignored when start/end set"}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
+        json!({"name":"atlas_search","description":"USE INSTEAD OF shell grep/rg for PHP symbols: find code entities by name, qualified name, occurrence expression or id. Text result: `# search nodes=N complete|next_cursor=C [tests=excluded]`, then one line per node: `path:line[-end]: kind name [resolution] if(condition)... key=value... | id=ID rev=N`. Ranked exact name > declarations > other > occurrence sites; pass next_cursor as cursor until complete. mode text = whole identifier (like grep -w), never inside string literals; substring = partial; symbol = exact declaration/member. Narrow with kinds (class, method, call_site, write_site, config_key...). Test code is left out unless include_tests. withGrep=true appends `# grep supplement`: source lines matching the same query that atlas did not return (comments, strings, configs, scripts); continue it with grepCursor.","inputSchema":{"type":"object","properties":{"area":{"type":["string","array"],"items":{"type":"string"},"description":"Only these areas (prefixes from .atlas/setup.yaml areas, e.g. partner, admin)"},"include_tests":{"type":"boolean","default":false,"description":"Keep code under ATLAS_TEST_PATHS (left out by default)"},"query":{"type":"string"},"kinds":{"type":"array","items":{"type":"string","pattern":"^[a-z0-9_]+$"},"minItems":1,"maxItems":20,"description":"Node kinds to keep (class, method, config_key, write_site, call_site, …). For withGrep, write_site/writes/magic_set/assignment also restrict grep to assignment-like lines."},"limit":{"type":"integer","minimum":1,"maximum":100,"default":20},"cursor":{"type":"string","description":"next_cursor from the previous node page (or path:line grep cursor when withGrep)"},"mode":{"type":"string","enum":["text","substring","symbol"],"default":"text","description":"text: whole identifier (like grep -w) in names and occurrence expressions; substring: partial match in the same fields; symbol: exact declaration/member/config_key match; withGrep uses word-boundary short name"},"withGrep":{"type":"boolean","default":false,"description":"Append literal grep hits missing from atlas results (scans watched source tree, not only paths already in the graph)"},"grepCursor":{"type":"string","description":"Continue truncated withGrep: pass grep.next_cursor / grep_next_cursor from the previous response"}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
+        json!({"name":"atlas_context","description":"Who calls / uses an entity, or its local graph. direction in (and the default for a class): callers tree `# callers ID levels=N complete|truncated [excluded.tests=N]`, root line, then `├`/`└` lines `Caller::method L12 L30 [resolved] if(cond): expression`; depth = call levels; a class lists its members used from outside, then their callers; a Yii2 `view:…` root lists who renders it. direction both/out on a method: numbered nodes `[n] path:line: kind name ... | id=ID rev=N` and edges `[n] -kind-> [m] path:line ...` (edges omit what their source line already shows); declaration members are not listed (omitted_members; use atlas_outline). Test callers are left out unless include_tests. resolution: resolved = from code types; annotated = only via PHPDoc, verify; candidate = several targets; unresolved/external = unknown or outside the index.","inputSchema":{"type":"object","properties":{"area":{"type":["string","array"],"items":{"type":"string"},"description":"Only these areas (prefixes from .atlas/setup.yaml areas, e.g. partner, admin)"},"include_tests":{"type":"boolean","default":false,"description":"Keep code under ATLAS_TEST_PATHS (left out by default)"},"entity_id":{"type":"string"},"depth":{"type":"integer","minimum":0,"maximum":config.max_context_depth},"max_nodes":{"type":"integer","minimum":1,"maximum":config.max_context_nodes},"direction":{"type":"string","enum":["both","in","out"],"default":"both"},"detail":{"type":"string","enum":["summary","full"],"default":"summary"},"include_diagnostics":{"type":"boolean","default":false}},"required":["entity_id"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
+        json!({"name":"atlas_outline","description":"USE INSTEAD OF shell grep/rg for PHP callers and structure (sections:[\"called_by\"] = every caller with arguments and guards). Compact structure of a class, interface, trait, method or Yii2 view as text: header `kind name path:line | id=ID`, then sections (`called_by:`, `calls:`, `members:`, `parents:`, `overridden_by:`...) with one indented line each; a requested empty section prints `<section>: none`. Interface methods list implementations under overridden_by. Class members: `L<line> <kind> <name>(<params>): <type> [magic|annotation|framework]`. calls: `L<line> <expression> -> <target> [resolution]`; called_by: `<caller> L<line>[ guards:[if(cond) return, …]]: <expression> [resolution]` (guards = up to 3 nearest early-exit checks of the caller before the call, omitted when none) (test callers left out unless include_tests, counted as `called_by (excluded.tests=N):`). For `view:…` nodes, called_by lists who `$this->render`/`renderPartial`s the template (`[renders]`); members are injected view params. sections:[\"called_by\"] for callers only.","inputSchema":{"type":"object","properties":{"area":{"type":["string","array"],"items":{"type":"string"},"description":"Only these areas (prefixes from .atlas/setup.yaml areas, e.g. partner, admin)"},"include_tests":{"type":"boolean","default":false,"description":"Keep code under ATLAS_TEST_PATHS (left out by default)"},"entity_id":{"type":"string"},"sections":{"type":"array","items":{"type":"string","enum":["owner","parents","interfaces","traits","children","implementations","overrides","overridden_by","calls","called_by","members"]},"minItems":1,"maxItems":11,"description":"Keep only these outline fields; omit for the default lean method / full class outline. Use [\"called_by\"] when listing callers."}},"required":["entity_id"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
+        json!({"name":"atlas_grep","description":"USE INSTEAD OF shell grep/rg for PHP and project text: full-text search over live sources (PHP, configs, comments, templates), including files without graph nodes. Literal or regex, case_sensitive, word (identifier boundaries), path_prefix, path_glob, include_vendor. Text result in ripgrep layout: `# grep hits=N scanned=F complete|next_cursor=C [incomplete] [excluded.<reason>=N]`, matches `path:line:col: text`, context `path-line- text`, files_with_matches one path per line, count `path:N`, `# skipped path reason`, `# error path: message`. Test code is left out unless include_tests; .git/.idea/.vscode are never scanned. No match lines and no `incomplete` means no match.","inputSchema":{"type":"object","properties":{"area":{"type":["string","array"],"items":{"type":"string"},"description":"Only these areas (prefixes from .atlas/setup.yaml areas, e.g. partner, admin)"},"include_tests":{"type":"boolean","default":false,"description":"Keep files under ATLAS_TEST_PATHS (left out by default, counted as excluded.tests)"},"query":{"type":"string","minLength":1},"regex":{"type":"boolean","default":false},"case_sensitive":{"type":"boolean","default":true},"word":{"type":"boolean","default":false},"path_prefix":{"type":"string"},"path_glob":{"type":["string","array"],"items":{"type":"string"},"description":"Glob(s) on the relative path: * ** ? [abc] [!abc] {a,b}; entries starting with ! exclude, e.g. [\"*.php\",\"!*/tests/*\"]"},"include_vendor":{"type":"boolean","default":false},"output":{"type":"string","enum":["content","files_with_matches","count"],"default":"content"},"context":{"type":"integer","minimum":0,"maximum":5,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50},"cursor":{"type":"string","description":"next_cursor from previous page (path:line)"}},"required":["query"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
+        json!({"name":"atlas_read","description":"Read live source lines: path+start_line/end_line, around_line+context, or entity_id (graph span, current file text). Max 400 lines. Text result: `# path:start-end [truncated]`, optional `# in: kind name path:start-end | id=…` (declaration that contains the requested line — use this when a spec file:line has drifted), then `line: text`. Prefer entity_id or search by symbol when the name is known; around_line recovers from stale line numbers.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"entity_id":{"type":"string"},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"around_line":{"type":"integer","minimum":1},"context":{"type":"integer","minimum":0,"maximum":50,"default":20,"description":"Lines around around_line, or ignored when start/end set"}},"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
         json!({"name":"atlas_correct","description":"Correct existing node or edge knowledge at agent trust level 2. Requires current revision (rev= on the node/edge line); cannot overwrite level 3 or create/delete objects. Patch contains metadata and optional edge to target. Text result: `# correction` and key=value lines.","inputSchema":{"type":"object","properties":{"kind":{"type":"string","enum":["node","edge"]},"id":{"type":"string"},"expected_revision":{"type":"integer","minimum":0},"patch":{"type":"object","properties":{"metadata":{"type":"object"},"to":{"type":["string","null"]}},"additionalProperties":false},"reason":{"type":"string","minLength":1}},"required":["kind","id","expected_revision","patch","reason"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false}}),
-        json!({"name":"atlas_batch","description":"Run 1-10 atlas tool calls in one request (like chaining shell commands). Result: one `# index` line, then `## [n] <tool>` followed by that tool's text, or `## [n] <tool> error: ...`; a failing call does not stop the others. Use it to combine independent lookups (several outlines, a grep and a read).","inputSchema":{"type":"object","properties":{"calls":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"tool":{"type":"string","enum":["atlas_search","atlas_context","atlas_outline","atlas_grep","atlas_read"]},"arguments":{"type":"object"}},"required":["tool","arguments"],"additionalProperties":false}}},"required":["calls"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
+        json!({"name":"atlas_batch","description":"Run 1-10 atlas tool calls in one request (like chaining shell commands). Result: one `# index` line, then `## [n] <tool>` followed by that tool's text, or `## [n] <tool> error: ...`; a failing call does not stop the others. Prefer {\"tool\":\"atlas_outline\",\"arguments\":{\"entity_id\":\"method:A::b\"}}; flat {\"tool\":\"atlas_outline\",\"entity_id\":\"method:A::b\"} is also accepted (fields next to tool are folded into arguments).","inputSchema":{"type":"object","properties":{"calls":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"tool":{"type":"string","enum":["atlas_search","atlas_context","atlas_outline","atlas_grep","atlas_read"]},"arguments":{"type":"object"}},"required":["tool"],"additionalProperties":true}}},"required":["calls"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"openWorldHint":false}}),
     ]
 }

@@ -1,0 +1,51 @@
+{
+  "mode": "atlas",
+  "run": 2,
+  "exit": 0,
+  "elapsed_s": 372.3,
+  "cost_usd": 2.0013194000000003,
+  "usage": {
+    "input_tokens": 42,
+    "cache_creation_input_tokens": 126851,
+    "cache_read_input_tokens": 1827517,
+    "output_tokens": 31042,
+    "output_tokens_details": {
+      "thinking_tokens": 19261
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 126851,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "global",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 11332,
+        "cache_read_input_tokens": 152443,
+        "cache_creation_input_tokens": 967,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 967
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard",
+    "fallback_credit": null
+  },
+  "tool_calls": 20,
+  "atlas_calls": 18,
+  "atlas_share": 0.9,
+  "must_find": {
+    "api_bonus_type": true,
+    "bgp_is_ended": true,
+    "create_freespin_bind_loop": true
+  },
+  "answer_head": "# Расследование MaxWin для фриспинов\n\nКод не менял, файлы не создавал. Использовал только Atlas и один раз прочитал гайд. Симптом на проде мне неизвестен, поэтому ищу ошибки в обе стороны: и когда игрок получает больше лимита, и когда недополучает.\n\n## 1. Как устроена логика\n\n**Настройка.** Лимит хранится в `max_win_setting_bonus.value` и читается через `Bonus::getMaxWin()` (`common/models/Bonus.php:727`) или `BonusCod::getMaxWin()` (`common/models/BonusCod.php:289`).\n\n**Создание записи-лимита `",
+  "stream": "atlas_2.jsonl"
+}

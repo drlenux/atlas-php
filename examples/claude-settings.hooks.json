@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.atlas/hooks/php-search-hint.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

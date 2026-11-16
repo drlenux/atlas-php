@@ -125,17 +125,6 @@ impl Unit {
                 .map_or(1, |t| t.end_line),
         }
     }
-    pub fn snippet(&self, start: usize, end: usize) -> String {
-        let span = self.span(start, end);
-        self.file
-            .source
-            .lines()
-            .enumerate()
-            .filter(|(i, _)| *i >= span.start_line.saturating_sub(4) && *i < span.end_line + 3)
-            .map(|(_, s)| s)
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
     pub fn fp(&self, start: usize, end: usize, skip: Option<usize>) -> String {
         tokens::fingerprint(
             (start..end)
@@ -215,6 +204,8 @@ pub struct Parameter {
     pub token: usize,
     /// `type_name` depends on a PHPDoc annotation.
     pub annotated: bool,
+    /// Declared as `...$name`: takes any number of arguments, so it is never "missing".
+    pub variadic: bool,
 }
 #[derive(Clone, Debug)]
 pub struct Function {
@@ -377,6 +368,7 @@ pub fn parse(
         ..Names::default()
     };
     parser.items(0, unit.tokens.len(), names, None, None, false, 0)?;
+    parser.add_file_scope_function()?;
     Ok(parser.out)
 }
 struct Parser<'a> {
@@ -387,6 +379,83 @@ struct Parser<'a> {
     closure_counts: BTreeMap<String, usize>,
 }
 impl Parser<'_> {
+    /// Top-level statements (views, scripts) get a synthetic function so flow runs.
+    fn add_file_scope_function(&mut self) -> Result<(), String> {
+        let n = self.unit.tokens.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let mut covered = vec![false; n];
+        for class in self.out.classes.values() {
+            for flag in covered.iter_mut().take(class.end.min(n)).skip(class.start) {
+                *flag = true;
+            }
+        }
+        for f in self.out.functions.values() {
+            for flag in covered.iter_mut().take(f.end.min(n)).skip(f.start) {
+                *flag = true;
+            }
+        }
+        if covered.iter().all(|c| *c) {
+            return Ok(());
+        }
+        let path = &self.unit.file.path;
+        let id = format!("function:file:{path}");
+        if self.out.functions.contains_key(&id) {
+            return Ok(());
+        }
+        let mut file_names = Names {
+            area: crate::domain::area_of(&self.options.areas, path).map(|a| a.prefix.clone()),
+            ..Names::default()
+        };
+        for (idx, tok) in self.unit.tokens.iter().enumerate() {
+            if covered.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            if tok.is("namespace") {
+                if let Some(name) = self
+                    .unit
+                    .tokens
+                    .get(idx + 1)
+                    .filter(|t| t.kind == TokenKind::Ident)
+                {
+                    file_names.namespace = name.text.clone();
+                }
+                break;
+            }
+            if tok.is("class") || tok.is("function") || tok.is("interface") || tok.is("trait") {
+                break;
+            }
+        }
+        file_names.imports = top_level_imports(self.unit, &covered);
+        self.out.functions.insert(
+            id.clone(),
+            Function {
+                id,
+                name: format!("{{file:{path}}}"),
+                qualified: format!("file:{path}"),
+                class: None,
+                names: file_names,
+                unit: self.unit_index,
+                start: 0,
+                end: n,
+                name_token: None,
+                body: Some((0, n)),
+                arrow: false,
+                closure: false,
+                parameters: Vec::new(),
+                return_type: "void".into(),
+                doc_return: None,
+                inferred_return: None,
+                uses_union_type: false,
+                owner: None,
+                magic: false,
+                captures: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+
     // Recursive parser context stays explicit at each declaration boundary.
     #[allow(clippy::too_many_arguments)]
     fn items(
@@ -827,6 +896,7 @@ impl Parser<'_> {
                     type_name,
                     token: var,
                     annotated,
+                    variadic: (a..var).any(|i| self.unit.is(i, "...")),
                 });
             }
         }
@@ -1028,4 +1098,50 @@ fn template_or(raw: &str, templates: &[String], names: &Names) -> String {
     } else {
         names.resolve(raw)
     }
+}
+
+/// Top-level `use Foo\Bar;` / `use Foo\Bar as Baz;` outside covered class/function spans.
+fn top_level_imports(unit: &Unit, covered: &[bool]) -> BTreeMap<String, String> {
+    let mut imports = BTreeMap::new();
+    let n = unit.tokens.len();
+    let mut i = 0;
+    while i < n {
+        if covered.get(i).copied().unwrap_or(false) {
+            i += 1;
+            continue;
+        }
+        if !unit.is(i, "use") {
+            i += 1;
+            continue;
+        }
+        if unit.is(i + 1, "function") || unit.is(i + 1, "const") {
+            i = unit.end_statement(i, n).saturating_add(1);
+            continue;
+        }
+        let stop = unit.end_statement(i, n);
+        if stop == n {
+            break;
+        }
+        for (a, b) in unit.split(i + 1, stop, ",") {
+            if a >= b || (a..b).any(|t| unit.is(t, "{")) {
+                continue;
+            }
+            if unit
+                .tokens
+                .get(a)
+                .is_none_or(|t| t.kind != TokenKind::Ident)
+            {
+                continue;
+            }
+            let full = unit.tokens[a].text.trim_start_matches('\\').to_string();
+            let alias = if a + 2 < b && unit.is(a + 1, "as") {
+                unit.tokens[a + 2].text.clone()
+            } else {
+                full.rsplit('\\').next().unwrap_or(&full).into()
+            };
+            imports.insert(alias, full);
+        }
+        i = stop + 1;
+    }
+    imports
 }

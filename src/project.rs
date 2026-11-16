@@ -106,6 +106,9 @@ impl SourceWalk<'_> {
             agent_token: "x".into(),
             review_token: "y".into(),
             allowed_origins: vec![],
+            logging: crate::logging::LoggingConfig::default(),
+            mcp_hook: crate::mcp_hook::McpHook::default(),
+            omit_resolutions: Vec::new(),
         };
         list_source_paths(&config)
     }

@@ -94,6 +94,62 @@ pub trait Repository: Send {
             .collect())
     }
 
+    /// Reviewed/agent objects only (`trust > 1`) under `paths`.
+    fn protected_nodes_for_paths(&mut self, paths: &BTreeSet<String>) -> Result<Vec<Node>> {
+        Ok(self
+            .nodes_for_paths(paths)?
+            .into_iter()
+            .filter(|n| n.trust > 1)
+            .collect())
+    }
+
+    /// Reviewed/agent edges under `paths` or touching `node_ids`.
+    fn protected_edges_for_paths(
+        &mut self,
+        paths: &BTreeSet<String>,
+        node_ids: &BTreeSet<String>,
+    ) -> Result<Vec<Edge>> {
+        Ok(self
+            .edges_for_paths(paths, node_ids)?
+            .into_iter()
+            .filter(|e| e.trust > 1)
+            .collect())
+    }
+
+    /// Drop analyzer-owned facts (`trust ≤ 1`) in `paths` without loading their JSON.
+    /// Returns `(deleted_nodes, deleted_edges)` counts. Protected objects stay.
+    fn clear_analyzer_facts_for_paths(
+        &mut self,
+        paths: &BTreeSet<String>,
+    ) -> Result<(usize, usize)> {
+        if paths.is_empty() {
+            return Ok((0, 0));
+        }
+        let drop_nodes: Vec<String> = self
+            .nodes_for_paths(paths)?
+            .into_iter()
+            .filter(|n| n.trust <= 1)
+            .map(|n| n.id)
+            .collect();
+        let drop_node_set: BTreeSet<_> = drop_nodes.iter().cloned().collect();
+        let drop_edges: Vec<String> = self
+            .edges()?
+            .into_iter()
+            .filter(|e| {
+                e.trust <= 1
+                    && (paths.contains(&e.span.path)
+                        || drop_node_set.contains(&e.from)
+                        || e.to.as_ref().is_some_and(|id| drop_node_set.contains(id)))
+            })
+            .map(|e| e.id)
+            .collect();
+        let edges_n = drop_edges.len();
+        self.delete_edges(&drop_edges)?;
+        let nodes_n = drop_nodes.len();
+        self.delete_nodes(&drop_nodes)?;
+        Ok((nodes_n, edges_n))
+    }
+
     fn source_paths(&mut self) -> Result<Vec<String>> {
         let mut paths: std::collections::BTreeSet<String> =
             self.nodes()?.into_iter().map(|n| n.span.path).collect();
@@ -223,12 +279,19 @@ fn symbol_match(node: &Node, query: &str, symbol: &str) -> bool {
     let bare = |value: &str| value.trim_start_matches('$').to_lowercase();
     node.id.eq_ignore_ascii_case(query)
         || (searchable_declaration(&node.kind)
-            && (bare(&node.name) == symbol || node.qualified_name.to_lowercase() == query))
+            && (bare(&node.name) == symbol || declaration_named_by(node, query)))
         || node.metadata["member_name"]
             .as_str()
             .is_some_and(|member| bare(member) == symbol)
         || value_constant_match(node, query, symbol)
         || qualified_occurrence_match(node, query)
+}
+
+/// The declaration's qualified name equals `query`, or `query` is `Owner::member` with the
+/// class short name only (`UserBonus::close` for `common\models\UserBonus::close`).
+fn declaration_named_by(node: &Node, query: &str) -> bool {
+    let qualified = node.qualified_name.to_lowercase();
+    qualified == query || (query.contains("::") && qualified.ends_with(&format!("\\{query}")))
 }
 
 fn value_constant_match(node: &Node, query: &str, symbol: &str) -> bool {

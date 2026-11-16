@@ -1,0 +1,46 @@
+# Ground truth for MaxWin freespin investigation (benchmark 3).
+# Freeze: pin slotor commit + Atlas image digest before any agent run.
+# Scoring: binary must_find in the agent's final answer (file path + concept).
+# Do NOT build this list from agent outputs after the run.
+
+task: maxwin-freespin
+source_reports: [report_3.md, report_3_v2.md]
+modes: [atlas_only, grep_only, unrestricted]
+n_per_mode: 5
+
+must_find:
+  - id: api_bonus_type
+    description: API activate promocode FS without bonus_type BONUS_COD → MaxWin not applied
+    paths:
+      - api/modules/v1/controllers/MyBonusController.php
+    tokens_any: [bonus_type, BONUS_COD]
+    # Atlas signal after R2b: called_by line L667 contains missing:[…, bonus_type]
+    atlas_outline:
+      entity: method:common\models\Freespin::createFreeSpin
+      section: called_by
+      must_contain:
+        - "MyBonusController::actionActivateBonus L667"
+        - "missing:[event, bonus_type]"
+
+  - id: bgp_is_ended
+    description: BackgroundGameProcess skips last-spin credit when freespin already END
+    paths:
+      - common/models/BackgroundGameProcess.php
+    tokens_any: [isEnded, is_ended]
+    line_hint: 175
+
+  - id: create_freespin_bind_loop
+    description: createFreeSpin MaxWin bind loop issues (dead BONUS check / is_promocod / null user_bonus_id)
+    paths:
+      - common/models/Freespin.php
+    tokens_any: [maxWin, MaxWin, BONUS, is_promocod, user_bonus_id]
+
+success:
+  atlas_only:
+    api_bonus_type: ">=4/5"
+    bgp_is_ended: ">=4/5"
+  # Equal or better recall than grep on api_bonus_type is the product gate.
+  reject_if:
+    - "atlas recall on api_bonus_type < grep recall"
+    - "atlas_only atlas tool share < 70%"
+    - "server Storage operation failed > 0"

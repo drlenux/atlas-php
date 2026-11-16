@@ -4,7 +4,7 @@
 
 ## Границы до реализации
 
-- Dockerfile остаётся единственным рецептом образа: PostgreSQL/pgvector, Atlas со встроенными плагинами, веб-ресурсы, миграции и entrypoint. Healthcheck и стабильные пути приложения входят в образ.
+- Dockerfile — рецепт образа приложения: Atlas со встроенными плагинами, веб-ресурсы и миграции. PostgreSQL — отдельный Compose-сервис на официальном образе. Healthcheck app входит в образ.
 - Основной docker-compose.yml использует только image из ATLAS_IMAGE. Рецепт локальной сборки вынесен в отдельный docker-compose.build.yml и не требуется получателю.
 - examples/compose.atlas.yml — самостоятельный фрагмент сервиса и named volume для добавления в чужой Compose без extends/include и ссылок на файлы Atlas.
 - Переменные хоста для встроенной БД имеют префикс ATLAS_POSTGRES_: чужой POSTGRES_PASSWORD/POSTGRES_DB не должны случайно настраивать Atlas. Внутри контейнера POSTGRES_* и PG* получают согласованные значения. Токены передаются ENV при запуске, не при сборке.

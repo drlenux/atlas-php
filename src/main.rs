@@ -2,6 +2,7 @@ use code_atlas::{
     config::Config,
     http::{self, HttpConfig, RpcReply},
     indexer::IndexCoordinator,
+    panic_guard,
     postgres::PostgresRepository,
     project::{discover, pending_paths, Debouncer},
     service::AtlasService,
@@ -41,6 +42,7 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
         return Err("unknown command; use --help".into());
     }
     let config = Config::from_env()?;
+    let log = code_atlas::logging::AtlasLog::open(&config.project_root, &config.logging)?;
     let mut repository = PostgresRepository::connect(&config.database_url)?;
     repository.migrate()?;
     let mut service = AtlasService::new(Box::new(repository));
@@ -49,7 +51,9 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if mode == "index" {
-        let report = IndexCoordinator::new(config).index(&mut service)?;
+        let report = IndexCoordinator::new(config)
+            .with_log(log)
+            .index(&mut service)?;
         println!("{}", serde_json::to_string(&report)?);
         return Ok(());
     }
@@ -73,6 +77,9 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
         grep_excludes: config.grep_excludes.clone(),
         read_excludes: config.read_excludes.clone(),
         areas: config.areas.clone(),
+        log: log.clone(),
+        mcp_hook: config.mcp_hook.clone(),
+        omit_resolutions: config.omit_resolutions.clone(),
     };
     if mode == "stdio" {
         return stdio(&mut service, &http_config);
@@ -87,7 +94,7 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
         let service = Arc::new(Mutex::new(service));
         let app = http::router(service.clone(), http_config);
         let stop = Arc::new(AtomicBool::new(false));
-        spawn_watcher(service.clone(), config, stop.clone());
+        spawn_watcher(service.clone(), config, log, stop.clone());
         let result = axum::serve(listener, app)
             .with_graceful_shutdown(shutdown())
             .await;
@@ -131,11 +138,13 @@ fn stdio(
     Ok(())
 }
 
-fn spawn_watcher(service: Arc<Mutex<AtlasService>>, config: Config, stop: Arc<AtomicBool>) {
-    let progress = service
-        .lock()
-        .expect("service available before watcher starts")
-        .indexing_progress();
+fn spawn_watcher(
+    service: Arc<Mutex<AtlasService>>,
+    config: Config,
+    log: code_atlas::logging::AtlasLog,
+    stop: Arc<AtomicBool>,
+) {
+    let progress = panic_guard::lock(&service).indexing_progress();
     // The observer scans files independently of builds, so pending changes are
     // reported while a build runs; the builder consumes its latest scan.
     let latest: Arc<Mutex<Option<BTreeMap<String, u64>>>> = Arc::default();
@@ -148,16 +157,22 @@ fn spawn_watcher(service: Arc<Mutex<AtlasService>>, config: Config, stop: Arc<At
         published.clone(),
     );
     thread::spawn(move || {
-        let mut coordinator = IndexCoordinator::new(config.clone()).with_progress(progress.clone());
+        let mut coordinator = IndexCoordinator::new(config.clone())
+            .with_log(log)
+            .with_progress(progress.clone());
         let mut debounce = Debouncer::new(config.debounce_ms);
         let started = Instant::now();
         while !stop.load(Ordering::Relaxed) {
-            let attempt = (|| -> Result<(), String> {
-                let Some(signature) = latest.lock().map_err(|_| "scan lock unavailable")?.clone()
-                else {
+            // A panic in analysis or publication fails this pass; the watcher thread survives.
+            let attempt = panic_guard::run(|| -> Result<(), String> {
+                let Some(signature) = panic_guard::lock(&latest).clone() else {
                     return Ok(());
                 };
                 let changed = debounce.observe(&signature, started.elapsed().as_millis() as u64);
+                // Never start a second build while one is running (avoids OOM from overlap).
+                if progress.snapshot().state == "running" {
+                    return Ok(());
+                }
                 // A reviewer's manual request (or a reset) runs a full rebuild.
                 let full = progress.take_reindex_request();
                 if full || changed {
@@ -167,16 +182,14 @@ fn spawn_watcher(service: Arc<Mutex<AtlasService>>, config: Config, stop: Arc<At
                     } else {
                         coordinator.prepare_changes()?
                     };
-                    let mut service = service.lock().map_err(|_| "service lock unavailable")?;
+                    let mut service = panic_guard::lock(&service);
                     let report = coordinator.publish(&mut service, prepared)?;
                     drop(service);
                     let files = coordinator.published_files().cloned();
                     if let Some(files) = &files {
                         progress.set_pending_paths(pending_paths(files, &signature));
                     }
-                    *published
-                        .lock()
-                        .map_err(|_| "publication lock unavailable")? = files;
+                    *panic_guard::lock(&published) = files;
                     eprintln!(
                         "indexed ({}): {} nodes, {} edges, {} diagnostics",
                         coordinator
@@ -188,7 +201,8 @@ fn spawn_watcher(service: Arc<Mutex<AtlasService>>, config: Config, stop: Arc<At
                     );
                 }
                 Ok(())
-            })();
+            })
+            .unwrap_or_else(|panic| Err(format!("indexing panicked: {panic}")));
             if let Err(error) = attempt {
                 if progress.snapshot().state != "failed" {
                     if progress.snapshot().state != "running" {

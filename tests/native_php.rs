@@ -204,7 +204,7 @@ fn return_cases_conditions_variables_and_origins_survive() {
         .as_str()
         .unwrap()
         .contains("42"));
-    assert!(r[1]["snippet"].as_str().unwrap().contains("return $number"));
+    assert!(r[1]["expression"].as_str().unwrap().contains("$number"));
     let v = node(&g, "variable:method:App\\Shop::choose:$number");
     assert_eq!(v.metadata["type"], "int");
     assert_eq!(v.metadata["assignments"].as_array().unwrap().len(), 1);
@@ -892,39 +892,71 @@ fn nested_object_cast_array_keeps_keys_conditions_and_nested_call() {
 }
 
 #[test]
-fn unsupported_construct_emits_one_primary_limitation_and_keeps_nested_call() {
+fn match_expression_walks_arm_calls_without_limitation() {
     let g = analyze(
-        "<?php class Probe { function run($a, $b) { return match($a) { 1 => load(), default => $b }; } function load(){return 1;} }",
+        "<?php class Probe { function run($a, $b) { return match($a) { 1 => $this->load(), default => $b }; } function load(){return 1;} }",
     );
-    // match is gated as unsupported_syntax for whole file when version denies it;
-    // for default 8.2 match is accepted by version gate but expression may be limited.
-    let limitations = g
+    assert_eq!(
+        edges(&g, "method:Probe::run", "calls", Some("method:Probe::load")).len(),
+        1,
+        "match arm call must resolve"
+    );
+    assert!(
+        !g.diagnostics
+            .iter()
+            .any(|d| d.code == "analysis_limitation"),
+        "match must not emit analysis_limitation: {:?}",
+        g.diagnostics
+    );
+}
+
+#[test]
+fn named_args_increment_instanceof_and_bitwise_are_not_unknown() {
+    let g = analyze(
+        r#"<?php
+class Probe {
+  function run($user, $flags, $key) {
+    $n = 0;
+    $n++;
+    log(userId: $user->id, flags: JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+    $cb = static fn(array $row): int => (int)$row['id'];
+    $x = $user->{$key};
+    return $user instanceof User || (...$flags) || $cb([]) || $x;
+  }
+}
+function log($userId, $flags) { return $userId; }
+class User {}
+"#,
+    );
+    let unknown = g
         .diagnostics
         .iter()
-        .filter(|d| d.code == "analysis_limitation")
+        .filter(|d| d.code == "analysis_limitation" && d.message.contains("Expression semantics"))
+        .map(|d| d.message.clone())
         .collect::<Vec<_>>();
-    if !g.nodes.is_empty() {
-        assert!(edges(&g, "method:Probe::run", "calls", Some("method:Probe::load")).len() <= 1);
-        assert!(
-            limitations.len() <= 2,
-            "cascaded limitations: {:?}",
-            limitations
-        );
-    }
+    assert!(
+        unknown.is_empty(),
+        "expected no unknown expression semantics: {unknown:?}"
+    );
+    assert_eq!(
+        edges(&g, "method:Probe::run", "calls", Some("function:log")).len(),
+        1
+    );
 }
 
 #[test]
 fn independent_limitations_on_one_line_remain_distinct() {
-    let g = analyze("<?php class Probe { function run($a, $b) { return ($a <=> $b) + (`raw`); } }");
-    // backticks / spaceship if not structurally supported should not collapse to one path+line dedupe hide
+    // Spaceship is supported; binary `~` is not — two independent unknowns on one line
+    // must both surface (path+line dedupe must not hide the second).
+    let g = analyze("<?php class Probe { function run($a, $b) { return ($a ~ $b) + ($a ~ $b); } }");
     let limitations = g
         .diagnostics
         .iter()
         .filter(|d| d.code == "analysis_limitation")
         .collect::<Vec<_>>();
     assert!(
-        !limitations.is_empty() || g.diagnostics.iter().any(|d| d.code == "parse_error"),
-        "expected limitation or parse evidence: {:?}",
+        limitations.len() >= 2,
+        "expected distinct limitations: {:?}",
         g.diagnostics
     );
 }

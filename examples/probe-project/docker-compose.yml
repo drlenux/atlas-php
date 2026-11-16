@@ -1,17 +1,34 @@
 services:
-  atlas:
-    image: ${ATLAS_IMAGE:-drlenux/memory-tools:probe-local}
+  atlas-db:
+    image: ${ATLAS_DB_IMAGE:-postgres:17-bookworm}
     restart: "no"
     environment:
       POSTGRES_DB: atlas
       POSTGRES_USER: atlas
       POSTGRES_PASSWORD: probe-pass
+    volumes:
+      - atlas-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U atlas -d atlas"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    stop_grace_period: 30s
+
+  atlas:
+    image: ${ATLAS_IMAGE:-drlenux/memory-tools:probe-local}
+    restart: "no"
+    depends_on:
+      atlas-db:
+        condition: service_healthy
+    environment:
       PGDATABASE: atlas
       PGUSER: atlas
       PGPASSWORD: probe-pass
       ATLAS_PROJECT_ROOT: /project
       ATLAS_BIND: 0.0.0.0:8080
-      ATLAS_DATABASE_URL: host=127.0.0.1 connect_timeout=5
+      ATLAS_DATABASE_URL: host=atlas-db connect_timeout=5
       ATLAS_AGENT_TOKEN: probe-agent
       ATLAS_REVIEW_TOKEN: probe-reviewer
       ATLAS_ALLOWED_ORIGINS: '["http://localhost:18085","http://127.0.0.1:18085"]'
@@ -20,7 +37,6 @@ services:
       ATLAS_MEMORY_LIMIT_MB: "1024"
       ATLAS_HOST_PORT: "18085"
     volumes:
-      - atlas-postgres:/var/lib/postgresql/data
       - type: bind
         source: .
         target: /project

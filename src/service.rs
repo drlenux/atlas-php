@@ -7,6 +7,8 @@ use crate::{
 };
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,6 +39,21 @@ pub struct SourceSlice {
     pub end_line: usize,
     pub lines: Vec<String>,
     pub truncated: bool,
+    /// Tightest declaration (method/function/class/…) that contains the requested
+    /// anchor line when reading by path. Spec `file:line` drifts land inside the
+    /// current span, so agents see which symbol they actually opened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enclosing: Option<EnclosingEntity>,
+}
+
+/// Graph declaration that contains a source line (`atlas_read` header `# in:`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct EnclosingEntity {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub start_line: usize,
+    pub end_line: usize,
 }
 
 /// Arguments for the `withGrep` supplement of a node search.
@@ -147,14 +164,14 @@ impl AtlasService {
         request: &ReadSourceRequest<'_>,
     ) -> Result<SourceSlice> {
         let max_lines = request.max_lines.max(1);
-        let (rel, start, end) = if let Some(id) = request.entity_id {
+        let (rel, start, end, anchor, locate) = if let Some(id) = request.entity_id {
             let node = self
                 .repository
                 .node(id)?
                 .ok_or_else(|| AtlasError::missing("node not found"))?;
             let start = node.span.start_line.max(1);
             let end = node.span.end_line.max(start);
-            (node.span.path, start, end)
+            (node.span.path, start, end, start, false)
         } else {
             let rel = request
                 .path
@@ -166,25 +183,30 @@ impl AtlasService {
                     "path must be relative within the project",
                 ));
             }
-            let (start, end) = if let Some(around) = request.around_line {
+            let (start, end, anchor) = if let Some(around) = request.around_line {
                 let ctx = request.context.min(50);
                 let start = around.saturating_sub(ctx).max(1);
                 let end = around.saturating_add(ctx);
-                (start, end)
+                (start, end, around.max(1))
             } else {
                 let start = request.start_line.unwrap_or(1).max(1);
                 let end = request
                     .end_line
                     .unwrap_or(start.saturating_add(max_lines.saturating_sub(1)));
-                (start, end.max(start))
+                (start, end.max(start), start)
             };
-            (rel, start, end)
+            (rel, start, end, anchor, true)
         };
         if crate::project::always_excluded(&rel)
             || crate::project::matches_exclusion(&rel, request.read_excludes)
         {
             return Err(AtlasError::invalid("path is outside the readable scope"));
         }
+        let enclosing = if locate {
+            self.enclosing_at(&rel, anchor)?
+        } else {
+            None
+        };
         let (lines, truncated) = grep_search::read_lines(root, &rel, start, end, max_lines)
             .map_err(AtlasError::invalid)?;
         Ok(SourceSlice {
@@ -195,7 +217,47 @@ impl AtlasService {
                 .max(start),
             lines,
             truncated,
+            enclosing,
         })
+    }
+
+    /// Tightest declaration that contains `line` in `path` (method > function > type).
+    fn enclosing_at(&mut self, path: &str, line: usize) -> Result<Option<EnclosingEntity>> {
+        let mut paths = BTreeSet::new();
+        paths.insert(path.to_owned());
+        let mut best: Option<Node> = None;
+        for node in self.repository.nodes_for_paths(&paths)? {
+            if !enclosing_kind(&node.kind) {
+                continue;
+            }
+            let span = &node.span;
+            if span.start_line == 0
+                || line < span.start_line
+                || line > span.end_line.max(span.start_line)
+            {
+                continue;
+            }
+            let rank = enclosing_rank(&node.kind);
+            let width = span.end_line.saturating_sub(span.start_line);
+            let better = match &best {
+                None => true,
+                Some(cur) => {
+                    let cur_rank = enclosing_rank(&cur.kind);
+                    let cur_width = cur.span.end_line.saturating_sub(cur.span.start_line);
+                    rank < cur_rank || (rank == cur_rank && width < cur_width)
+                }
+            };
+            if better {
+                best = Some(node);
+            }
+        }
+        Ok(best.map(|node| EnclosingEntity {
+            id: node.id,
+            kind: node.kind,
+            name: node.name,
+            start_line: node.span.start_line,
+            end_line: node.span.end_line.max(node.span.start_line),
+        }))
     }
 
     pub fn index(
@@ -208,6 +270,31 @@ impl AtlasService {
         progress.phase("publishing", "waiting_for_writer", None, "items");
         transactional(self.repository.as_mut(), |r| {
             let report = apply_snapshot(r, snapshot, indexed_paths, removed_paths, &progress)?;
+            r.set_meta(INDEXED_AT, &now().to_string())?;
+            progress.phase("publishing", "commit", None, "items");
+            Ok(report)
+        })
+    }
+
+    /// Publish a graph spilled to `dir`/`nodes.jsonl` + `edges.jsonl` (lean replace).
+    pub fn index_spilled(
+        &mut self,
+        dir: &Path,
+        diagnostics: Vec<Diagnostic>,
+        indexed_paths: Vec<String>,
+        removed_paths: Vec<String>,
+    ) -> Result<IndexReport> {
+        let progress = self.progress.clone();
+        progress.phase("publishing", "waiting_for_writer", None, "items");
+        transactional(self.repository.as_mut(), |r| {
+            let report = apply_spilled_snapshot(
+                r,
+                dir,
+                diagnostics,
+                indexed_paths,
+                removed_paths,
+                &progress,
+            )?;
             r.set_meta(INDEXED_AT, &now().to_string())?;
             progress.phase("publishing", "commit", None, "items");
             Ok(report)
@@ -413,11 +500,19 @@ impl AtlasService {
             tree.members_without_usages = unused;
         } else if request.levels > 0 {
             let edges = self.repository.adjacent_edges(&root.id)?;
-            let mut sites = self.caller_sites(&edges, &root.id, &CALL_KINDS)?;
-            let (guesses, counted) = self.name_only_sites(&root)?;
-            sites.extend(guesses);
+            // Views are reached via Yii2 `renders`, not `calls`.
+            let kinds: &[&str] = if root.kind == "view" {
+                &["renders"]
+            } else {
+                &CALL_KINDS
+            };
+            let mut sites = self.caller_sites(&edges, &root.id, kinds)?;
+            if root.kind != "view" {
+                let (guesses, counted) = self.name_only_sites(&root)?;
+                sites.extend(guesses);
+                tree.name_only_callers = counted;
+            }
             sites.sort_by(|a, b| (&a.owner_label, a.line).cmp(&(&b.owner_label, b.line)));
-            tree.name_only_callers = counted;
             let mut path = vec![root.id.clone()];
             tree.children = self.caller_nodes(sites, request.levels, &mut path, &mut walk)?;
         }
@@ -546,13 +641,24 @@ impl AtlasService {
                     resolutions.push(flag.clone());
                 }
             }
+            let mut missing: Vec<String> = Vec::new();
+            for name in std::iter::once(&first)
+                .chain(rest.iter())
+                .flat_map(|s| s.missing.iter())
+            {
+                if !missing.contains(name) {
+                    missing.push(name.clone());
+                }
+            }
             let mut node = CallerNode {
                 label: first.owner_label.clone(),
+                missing,
                 id: first.owner_id.clone(),
                 path: first.path.clone(),
                 lines,
                 resolutions,
                 conditions: first.conditions.clone(),
+                guards: first.guards.clone(),
                 expression: first.expression.clone(),
                 area: first.area.clone(),
                 ..CallerNode::default()
@@ -705,6 +811,131 @@ impl AtlasService {
             let (nodes, edges) = finalize_usage(used_nodes, used_edges);
             return Ok((outline, nodes, edges));
         }
+        // SQL / AR column graph: sites, tables, columns, mapped properties.
+        if matches!(
+            node.kind.as_str(),
+            "sql_site" | "table" | "column" | "property"
+        ) {
+            if want.owner && node.kind == "property" {
+                outline.owner = incoming("contains").into_iter().next();
+                if let Some(owner) = &outline.owner {
+                    used_nodes.push(owner.clone());
+                }
+            }
+            if want.called_by {
+                let kinds: &[&str] = match node.kind.as_str() {
+                    "table" | "column" => &["sql_reads", "sql_writes"],
+                    "property" => &["writes", "reads", "property_access"],
+                    _ => &[],
+                };
+                if !kinds.is_empty() {
+                    let mut sites = self.caller_sites(&edges, id, kinds)?;
+                    sites.retain(|site| include.as_ref().is_none_or(|re| re.is_match(&site.path)));
+                    let (callers, excluded) = format_callers(sites, exclude.as_ref());
+                    outline.called_by = callers;
+                    outline.excluded_tests = excluded;
+                }
+                // Reverse maps_*: who maps to this table/column.
+                if matches!(node.kind.as_str(), "table" | "column") {
+                    let map_kind = if node.kind == "table" {
+                        "maps_table"
+                    } else {
+                        "maps_column"
+                    };
+                    for from in incoming(map_kind) {
+                        used_nodes.push(from.clone());
+                        outline.called_by.push(format!("← {map_kind} {from}"));
+                    }
+                }
+            }
+            if want.members || want.calls {
+                let mut lines = Vec::new();
+                for edge in edges.iter().filter(|e| e.from == id) {
+                    let Some(to) = edge.to.as_deref() else {
+                        continue;
+                    };
+                    if matches!(
+                        edge.kind.as_str(),
+                        "sql_reads"
+                            | "sql_writes"
+                            | "maps_table"
+                            | "maps_column"
+                            | "contains"
+                            | "writes"
+                            | "reads"
+                    ) {
+                        used_nodes.push(to.to_owned());
+                        used_edges.push(edge.id.clone());
+                        lines.push(format!("{} → {to}", edge.kind));
+                    }
+                }
+                lines.sort();
+                lines.dedup();
+                if want.calls {
+                    outline.calls = lines.clone();
+                }
+                if want.members {
+                    outline.members = lines;
+                }
+            }
+            outline.none = empty_sections(
+                &outline,
+                &stated_sections(
+                    sections,
+                    &["called_by", "members", "calls"],
+                    &["owner", "called_by", "members", "calls"],
+                ),
+                &want,
+            );
+            let (nodes, edges) = finalize_usage(used_nodes, used_edges);
+            return Ok((outline, nodes, edges));
+        }
+        // Yii2 `view:` nodes: owner controller (`contains`), who renders (`renders`), params.
+        if node.kind == "view" {
+            if want.owner {
+                // Prefer the controller class that owns this view via render.
+                let mut owners = incoming("contains");
+                owners.retain(|oid| oid.starts_with("class:"));
+                outline.owner = owners.into_iter().next();
+                if let Some(owner) = &outline.owner {
+                    used_nodes.push(owner.clone());
+                }
+            }
+            if want.called_by {
+                let mut sites = self.caller_sites(&edges, id, &["renders"])?;
+                sites.retain(|site| include.as_ref().is_none_or(|re| re.is_match(&site.path)));
+                let (callers, excluded) = format_callers(sites, exclude.as_ref());
+                outline.called_by = callers;
+                outline.excluded_tests = excluded;
+            }
+            if want.members {
+                let mut members = Vec::new();
+                for edge in edges
+                    .iter()
+                    .filter(|e| e.kind == "contains" && e.from == id)
+                {
+                    if let Some(member) = edge.to.as_deref().map(|to| self.repository.node(to)) {
+                        if let Some(member) = member?.filter(|m| m.kind == "variable") {
+                            used_nodes.push(member.id.clone());
+                            members.push(member);
+                        }
+                    }
+                }
+                members.sort_by(|a, b| a.name.cmp(&b.name));
+                outline.members = members.iter().map(member_line).collect();
+            }
+            outline.none = empty_sections(
+                &outline,
+                &stated_sections(
+                    sections,
+                    &["owner", "called_by", "members"],
+                    &["owner", "called_by", "members"],
+                ),
+                &want,
+            );
+            let (nodes, edges) = finalize_usage(used_nodes, used_edges);
+            return Ok((outline, nodes, edges));
+        }
         if want.parents {
             outline.parents = self.ancestors(id)?;
             used_nodes.extend(outline.parents.iter().cloned());
@@ -735,7 +966,7 @@ impl AtlasService {
                     if let Some(member) = member?.filter(|m| {
                         matches!(
                             m.kind.as_str(),
-                            "method" | "function" | "property" | "constant"
+                            "method" | "function" | "property" | "constant" | "view"
                         )
                     }) {
                         used_nodes.push(member.id.clone());
@@ -890,12 +1121,11 @@ impl AtlasService {
                 owner_id,
                 path: site.span.path.clone(),
                 line: site.span.start_line,
-                expression: site.metadata["expression"]
-                    .as_str()
-                    .unwrap_or(site.name.as_str())
-                    .to_owned(),
+                expression: site_expression(&[&site.metadata], &site.name),
                 flags: vec![NAME_ONLY_FLAG.into()],
                 conditions: string_list(&site.metadata["conditions"]),
+                guards: Vec::new(),
+                missing: Vec::new(),
             });
         }
         Ok((sites, 0))
@@ -910,6 +1140,9 @@ impl AtlasService {
         kinds: &[&str],
     ) -> Result<Vec<CallerSite>> {
         let mut sites = Vec::new();
+        let mut owners = BTreeMap::new();
+        // Signature the call sites are compared with (for `missing:[…]`).
+        let callee = self.repository.node(target)?;
         for call in edges
             .iter()
             .filter(|e| kinds.contains(&e.kind.as_str()) && e.to.as_deref() == Some(target))
@@ -930,20 +1163,17 @@ impl AtlasService {
             } else {
                 site.span.start_line
             };
-            let expression = [&call.metadata, &site.metadata]
-                .into_iter()
-                .find_map(|metadata| metadata["expression"].as_str().filter(|s| !s.is_empty()))
-                .unwrap_or(site.name.as_str())
-                .to_owned();
-            let conditions = site.metadata["conditions"]
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|c| c.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let expression = site_expression(&[&call.metadata, &site.metadata], &site.name);
+            let missing = match (&callee, call.kind == "calls") {
+                (Some(callee), true) => {
+                    missing_parameters(&callee.metadata, &[&call.metadata, &site.metadata])
+                }
+                _ => Vec::new(),
+            };
+            let shown = self.guards_before(owner_id.as_deref(), line, &mut owners)?;
+            // A shown guard already states its negation as a branch condition.
+            let mut conditions = string_list(&site.metadata["conditions"]);
+            conditions.retain(|c| !shown.iter().any(|g| *c == g.negation()));
             sites.push(CallerSite {
                 area: site.metadata["area"].as_str().map(str::to_owned),
                 owner_id,
@@ -953,10 +1183,39 @@ impl AtlasService {
                 expression,
                 flags: call_flags(call),
                 conditions,
+                guards: shown.iter().map(Guard::label).collect(),
+                missing,
             });
         }
         sites.sort_by(|a, b| (&a.owner_label, a.line).cmp(&(&b.owner_label, b.line)));
         Ok(sites)
+    }
+
+    /// The nearest early-exit guards of `owner` that precede a site at `line` inside the
+    /// same block (`metadata.guards`, written at indexing). `cache` holds the guards of
+    /// owners already read during one lookup.
+    fn guards_before(
+        &mut self,
+        owner: Option<&str>,
+        line: usize,
+        cache: &mut BTreeMap<String, Vec<Guard>>,
+    ) -> Result<Vec<Guard>> {
+        let Some(owner) = owner else {
+            return Ok(Vec::new());
+        };
+        if !cache.contains_key(owner) {
+            let guards = match self.repository.node(owner)? {
+                Some(node) => Guard::from_metadata(&node.metadata),
+                None => Vec::new(),
+            };
+            cache.insert(owner.to_owned(), guards);
+        }
+        let applicable: Vec<&Guard> = cache[owner]
+            .iter()
+            .filter(|g| g.end_line < line && line <= g.scope_end_line)
+            .collect();
+        let skipped = applicable.len().saturating_sub(GUARDS_SHOWN);
+        Ok(applicable.into_iter().skip(skipped).cloned().collect())
     }
 
     fn ancestors(&mut self, id: &str) -> Result<Vec<String>> {
@@ -1323,10 +1582,12 @@ fn format_callers(sites: Vec<CallerSite>, exclude: Option<&regex::Regex>) -> (Ve
             continue;
         }
         lines.push(format!(
-            "{} L{}: {} [{}]",
+            "{} L{}{}{}: {} [{}]",
             site.owner_label,
             site.line,
-            short_expression(&site.expression),
+            guards_suffix(&site.guards),
+            missing_suffix(&site.missing),
+            site.expression,
             site.flags.join(", ")
         ));
     }
@@ -1363,6 +1624,103 @@ const CALL_KINDS: [&str; 3] = ["calls", "dispatches", "magic_get"];
 /// Edges through which a class member is used (class-root usages).
 const USAGE_KINDS: [&str; 5] = ["calls", "dispatches", "magic_get", "reads", "writes"];
 
+/// Guards listed per caller (nearest to the call kept).
+const GUARDS_SHOWN: usize = 3;
+/// Characters of one guard condition shown in callers output.
+const GUARD_CONDITION_SHOWN: usize = 60;
+
+/// An early-exit branch (`if (cond) return;`) of a function, from `metadata.guards`.
+#[derive(Clone)]
+struct Guard {
+    end_line: usize,
+    scope_end_line: usize,
+    condition: String,
+    exit: String,
+}
+
+impl Guard {
+    fn from_metadata(metadata: &Value) -> Vec<Guard> {
+        let number = |g: &Value, key: &str| g[key].as_u64().map(|n| n as usize);
+        metadata["guards"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|g| {
+                Some(Guard {
+                    end_line: number(g, "end_line")?,
+                    scope_end_line: number(g, "scope_end_line")?,
+                    condition: g["condition"].as_str()?.to_owned(),
+                    exit: g["exit"].as_str().unwrap_or("exit").to_owned(),
+                })
+            })
+            .collect()
+    }
+
+    /// Branch condition recorded for sites after this guard.
+    fn negation(&self) -> String {
+        format!("!({})", self.condition)
+    }
+
+    /// `if(cond) return`, the condition bounded for callers output.
+    fn label(&self) -> String {
+        let flat = flatten(&self.condition);
+        let condition = if flat.chars().count() > GUARD_CONDITION_SHOWN {
+            let head: String = flat.chars().take(GUARD_CONDITION_SHOWN - 1).collect();
+            format!("{head}…")
+        } else {
+            flat
+        };
+        format!("if({condition}) {}", self.exit)
+    }
+}
+
+/// `owner L<line> guards:[…]` suffix; empty without guards.
+fn guards_suffix(guards: &[String]) -> String {
+    if guards.is_empty() {
+        String::new()
+    } else {
+        format!(" guards:[{}]", guards.join(", "))
+    }
+}
+
+/// ` missing:[a, b]` suffix; empty when the site passes every parameter.
+fn missing_suffix(missing: &[String]) -> String {
+    if missing.is_empty() {
+        String::new()
+    } else {
+        format!(" missing:[{}]", missing.join(", "))
+    }
+}
+
+/// Names of callee parameters (`metadata.parameters`) that a call site passes neither
+/// positionally nor by name, in declaration order. Variadic parameters are skipped; a
+/// site with an unpacked `...$args` or without recorded arguments states nothing.
+/// Only names are returned, never default values.
+fn missing_parameters(callee: &Value, call: &[&Value]) -> Vec<String> {
+    let (Some(parameters), Some(arguments)) = (
+        callee["parameters"].as_array(),
+        call.iter().find_map(|m| m["arguments"].as_array()),
+    ) else {
+        return Vec::new();
+    };
+    if arguments.iter().any(|a| a["spread"] == true) {
+        return Vec::new();
+    }
+    let positional = arguments.iter().filter(|a| a["name"].is_null()).count();
+    let named: BTreeSet<&str> = arguments
+        .iter()
+        .filter_map(|a| a["name"].as_str())
+        .collect();
+    parameters
+        .iter()
+        .skip(positional)
+        .filter(|p| p["variadic"] != true)
+        .filter_map(|p| p["name"].as_str())
+        .filter(|name| !named.contains(name))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// One usage site and the function or method that contains it.
 struct CallerSite {
     /// Area prefix of the site (`metadata.area`).
@@ -1374,6 +1732,10 @@ struct CallerSite {
     expression: String,
     flags: Vec<String>,
     conditions: Vec<String>,
+    /// Nearest early-exit guards before the site, oldest first (`if(cond) return`).
+    guards: Vec<String>,
+    /// Callee parameters this site does not pass (see `missing_parameters`).
+    missing: Vec<String>,
 }
 
 /// Budget and test filter shared by one callers-tree walk.
@@ -1432,6 +1794,22 @@ fn is_class_like(kind: &str) -> bool {
     matches!(kind, "class" | "interface" | "trait" | "enum")
 }
 
+fn enclosing_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "method" | "function" | "class" | "interface" | "trait" | "enum"
+    )
+}
+
+/// Lower is tighter: callables beat type declarations.
+fn enclosing_rank(kind: &str) -> u8 {
+    match kind {
+        "method" | "function" => 0,
+        "class" | "interface" | "trait" | "enum" => 1,
+        _ => 2,
+    }
+}
+
 fn is_callable_id(id: &str) -> bool {
     id.starts_with("method:") || id.starts_with("function:")
 }
@@ -1441,6 +1819,9 @@ fn call_flags(call: &Edge) -> Vec<String> {
         .as_str()
         .unwrap_or("unresolved")
         .to_owned()];
+    if call.kind == "renders" {
+        flags.push("renders".into());
+    }
     if let Some(queue) = call.metadata["queue"].as_str() {
         flags.push(format!("queue {queue}"));
     }
@@ -1468,11 +1849,75 @@ fn symbol_name(id: &str) -> String {
 }
 
 fn short_expression(text: &str) -> String {
-    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = flatten(text);
     if flat.chars().count() > 80 {
         format!("{}…", flat.chars().take(79).collect::<String>())
     } else {
         flat
+    }
+}
+
+fn flatten(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Call expressions longer than this are shown as `callee(name: value, …)`.
+const SITE_EXPRESSION_MAX: usize = 100;
+
+/// Display text of a usage site, bounded for callers output. A long call whose
+/// arguments were stored structured (named args, array keys) keeps every argument name
+/// and shortens only the values; other long text keeps its head.
+fn site_expression(metadata: &[&Value], fallback: &str) -> String {
+    let Some(metadata) = metadata
+        .iter()
+        .find(|m| m["expression"].as_str().is_some_and(|s| !s.is_empty()))
+    else {
+        return short_expression(fallback);
+    };
+    let raw = metadata["expression"].as_str().unwrap_or_default();
+    let flat = flatten(raw);
+    // `clip_expr` may truncate a multi-line call under the char budget after flatten
+    // (deep indent). Prefer structured args whenever the stored expression lost its tail.
+    let clipped = raw.contains('…');
+    if flat.chars().count() <= SITE_EXPRESSION_MAX && !clipped {
+        return raw.to_owned();
+    }
+    structured_call(metadata).unwrap_or_else(|| {
+        format!(
+            "{}…",
+            flat.chars()
+                .take(SITE_EXPRESSION_MAX - 1)
+                .collect::<String>()
+        )
+    })
+}
+
+/// `callee(param: value, key => value, …)` from `metadata.callee` + `metadata.arguments`.
+fn structured_call(metadata: &Value) -> Option<String> {
+    let callee = metadata["callee"].as_str()?;
+    let arguments = metadata["arguments"].as_array()?;
+    let rendered: Vec<String> = arguments.iter().map(argument_text).collect();
+    Some(flatten(&format!("{callee}({})", rendered.join(", "))))
+}
+
+fn argument_text(argument: &Value) -> String {
+    let text = |value: &Value| value.as_str().unwrap_or("…").to_owned();
+    let value = match argument["items"]
+        .as_array()
+        .filter(|items| !items.is_empty())
+    {
+        Some(items) => {
+            let items: Vec<String> = items
+                .iter()
+                .map(|item| format!("{} => {}", text(&item["name"]), text(&item["value"])))
+                .collect();
+            format!("[{}]", items.join(", "))
+        }
+        None => text(&argument["value"]),
+    };
+    match argument["name"].as_str() {
+        Some(name) => format!("{name}: {value}"),
+        None => value,
     }
 }
 
@@ -1768,9 +2213,33 @@ fn summarize(metadata: &mut Value, detail: Detail) {
         }
     }
 }
+/// Summary projection of magic members: `magic` and `type_source` stay, the framework
+/// bookkeeping repeated on every column/property line goes (Detail::Full keeps it).
+fn drop_magic_noise(metadata: &mut Value) {
+    let Some(fields) = metadata.as_object_mut() else {
+        return;
+    };
+    if fields.get("magic") != Some(&Value::Bool(true)) {
+        return;
+    }
+    fields.remove("framework");
+    if matches!(
+        fields.get("access").and_then(Value::as_str),
+        Some("readwrite" | "read-write")
+    ) {
+        fields.remove("access");
+    }
+    // Column evidence (`rules`, `attributes`, …) adds nothing to `ar_attribute`;
+    // other evidence (`relation`, `component`) tells what the member is.
+    if fields.get("ar_attribute") == Some(&Value::Bool(true)) {
+        fields.remove("framework_evidence");
+    }
+}
+
 fn project_node(mut node: Node, detail: Detail) -> Node {
     summarize(&mut node.metadata, detail);
     if detail == Detail::Summary {
+        drop_magic_noise(&mut node.metadata);
         // Drop redundant QN copies that only inflate MCP/search token counts.
         // Keep revision: agents need it for atlas_correct after reading a summary.
         let unprefixed_id = node
@@ -2055,6 +2524,159 @@ fn refresh_metadata(previous: &Value, next: &Value, trust: u8) -> Value {
     protected
 }
 
+/// Full project publishes load hundreds of thousands of previous nodes into RAM on
+/// top of the incoming snapshot and OOM under 2 GiB. Above this path count, drop
+/// analyzer-owned (`trust ≤ 1`) facts in SQL and only keep protected objects in RAM.
+const LEAN_PUBLISH_PATHS: usize = 256;
+/// Upsert chunk size while publishing — keeps a second full graph copy out of RAM.
+const WRITE_CHUNK: usize = 400;
+
+/// Stream a spilled full graph: clear trust≤1 in scope, upsert from JSONL, keep protected.
+fn apply_spilled_snapshot(
+    r: &mut dyn Repository,
+    dir: &Path,
+    diagnostics: Vec<Diagnostic>,
+    indexed_paths: Vec<String>,
+    removed_paths: Vec<String>,
+    progress: &IndexingProgress,
+) -> Result<IndexReport> {
+    let scopes: BTreeSet<String> = indexed_paths.into_iter().chain(removed_paths).collect();
+    progress.set_files_total(scopes.len());
+    progress.phase(
+        "publishing",
+        "clear_analyzer_previous",
+        Some(scopes.len()),
+        "files",
+    );
+    let (cleared_nodes, cleared_edges) = r.clear_analyzer_facts_for_paths(&scopes)?;
+    let protected_nodes = r.protected_nodes_for_paths(&scopes)?;
+    let protected: BTreeMap<String, Node> = protected_nodes
+        .into_iter()
+        .map(|n| (n.id.clone(), n))
+        .collect();
+    progress.advance(scopes.len(), None);
+
+    let node_file =
+        File::open(dir.join("nodes.jsonl")).map_err(|e| AtlasError::storage(e.to_string()))?;
+    let mut retained: BTreeSet<String> = protected.keys().cloned().collect();
+    let mut node_batch = Vec::with_capacity(WRITE_CHUNK);
+    progress.phase("publishing", "write_nodes", None, "items");
+    for (position, line) in BufReader::new(node_file).lines().enumerate() {
+        let line = line.map_err(|e| AtlasError::storage(e.to_string()))?;
+        if line.is_empty() {
+            continue;
+        }
+        let mut node: Node =
+            serde_json::from_str(&line).map_err(|e| AtlasError::invalid(e.to_string()))?;
+        if node.id.is_empty() || !node.metadata.is_object() || !scopes.contains(&node.span.path) {
+            return Err(AtlasError::invalid(format!(
+                "node {} path {} outside successful index scope",
+                node.id, node.span.path
+            )));
+        }
+        if let Some(old) = protected.get(&node.id) {
+            node.metadata = refresh_metadata(&old.metadata, &node.metadata, old.trust);
+            node.trust = old.trust;
+            node.revision = old.revision + 1;
+        } else {
+            node.trust = 1;
+            node.revision = 1;
+        }
+        retained.insert(node.id.clone());
+        let path = node.span.path.clone();
+        node_batch.push(node);
+        if node_batch.len() >= WRITE_CHUNK {
+            r.put_nodes(&node_batch)?;
+            node_batch.clear();
+        }
+        if position % 2048 == 0 {
+            progress.advance(position + 1, Some(&path));
+        }
+    }
+    if !node_batch.is_empty() {
+        r.put_nodes(&node_batch)?;
+    }
+    drop(node_batch);
+    drop(protected);
+
+    let edge_file =
+        File::open(dir.join("edges.jsonl")).map_err(|e| AtlasError::storage(e.to_string()))?;
+    let mut written_edges = 0usize;
+    let mut available = retained.clone();
+    let mut edge_batch = Vec::with_capacity(WRITE_CHUNK);
+    progress.phase("publishing", "write_edges", None, "items");
+    for (position, line) in BufReader::new(edge_file).lines().enumerate() {
+        let line = line.map_err(|e| AtlasError::storage(e.to_string()))?;
+        if line.is_empty() {
+            continue;
+        }
+        let mut edge: Edge =
+            serde_json::from_str(&line).map_err(|e| AtlasError::invalid(e.to_string()))?;
+        if !edge.metadata.is_object() {
+            return Err(AtlasError::invalid("edge metadata must be an object"));
+        }
+        if !available.contains(&edge.from)
+            || edge.to.as_ref().is_some_and(|id| !available.contains(id))
+        {
+            let mut missing = BTreeSet::new();
+            if !available.contains(&edge.from) {
+                missing.insert(edge.from.clone());
+            }
+            if let Some(to) = &edge.to {
+                if !available.contains(to) {
+                    missing.insert(to.clone());
+                }
+            }
+            available.extend(r.existing_node_ids(&missing)?);
+        }
+        if let Some(unknown) = std::iter::once(&edge.from)
+            .chain(edge.to.iter())
+            .find(|id| !available.contains(*id))
+        {
+            return Err(AtlasError::invalid(format!(
+                "snapshot edge {} refers to an unknown node {unknown}",
+                edge.id
+            )));
+        }
+        edge.trust = 1;
+        edge.revision = 1;
+        let path = edge.span.path.clone();
+        edge_batch.push(edge);
+        if edge_batch.len() >= WRITE_CHUNK {
+            written_edges += edge_batch.len();
+            r.put_edges(&edge_batch)?;
+            edge_batch.clear();
+        }
+        if position % 2048 == 0 {
+            progress.advance(position + 1, Some(&path));
+        }
+    }
+    if !edge_batch.is_empty() {
+        written_edges += edge_batch.len();
+        r.put_edges(&edge_batch)?;
+    }
+    drop(edge_batch);
+
+    progress.phase("publishing", "cleanup", Some(1), "items");
+    progress.advance(1, None);
+    let reported: BTreeSet<&str> = diagnostics.iter().map(|d| d.path.as_str()).collect();
+    let mut kept: Vec<_> = r
+        .diagnostics()?
+        .into_iter()
+        .filter(|d| !scopes.contains(&d.path) && !reported.contains(d.path.as_str()))
+        .collect();
+    let diag_count = diagnostics.len();
+    kept.extend(diagnostics);
+    r.set_diagnostics(&kept)?;
+    Ok(IndexReport {
+        nodes: retained.len(),
+        edges: written_edges,
+        deleted_nodes: cleared_nodes,
+        deleted_edges: cleared_edges,
+        diagnostics: diag_count,
+    })
+}
+
 fn apply_snapshot(
     r: &mut dyn Repository,
     mut snapshot: GraphSnapshot,
@@ -2065,37 +2687,75 @@ fn apply_snapshot(
     let scopes: BTreeSet<String> = indexed_paths.into_iter().chain(removed_paths).collect();
     progress.set_files_total(scopes.len());
     progress.phase("publishing", "load_previous", Some(scopes.len()), "files");
-    let old_nodes: BTreeMap<String, Node> = r
-        .nodes_for_paths(&scopes)?
-        .into_iter()
-        .map(|n| (n.id.clone(), n))
-        .collect();
-    let scoped_node_ids: BTreeSet<_> = old_nodes.keys().cloned().collect();
-    let old_edges: BTreeMap<String, Edge> = r
-        .edges_for_paths(&scopes, &scoped_node_ids)?
-        .into_iter()
-        .map(|e| (e.id.clone(), e))
-        .collect();
+    let lean = scopes.len() >= LEAN_PUBLISH_PATHS;
+    let (old_nodes, old_edges, lean_deleted_nodes, lean_deleted_edges) = if lean {
+        progress.phase(
+            "publishing",
+            "clear_analyzer_previous",
+            Some(scopes.len()),
+            "files",
+        );
+        let (cleared_nodes, cleared_edges) = r.clear_analyzer_facts_for_paths(&scopes)?;
+        let protected_nodes = r.protected_nodes_for_paths(&scopes)?;
+        let protected_ids: BTreeSet<_> = protected_nodes.iter().map(|n| n.id.clone()).collect();
+        let protected_edges = r.protected_edges_for_paths(&scopes, &protected_ids)?;
+        let old_nodes: BTreeMap<String, Node> = protected_nodes
+            .into_iter()
+            .map(|n| (n.id.clone(), n))
+            .collect();
+        let old_edges: BTreeMap<String, Edge> = protected_edges
+            .into_iter()
+            .map(|e| (e.id.clone(), e))
+            .collect();
+        (old_nodes, old_edges, cleared_nodes, cleared_edges)
+    } else {
+        let old_nodes: BTreeMap<String, Node> = r
+            .nodes_for_paths(&scopes)?
+            .into_iter()
+            .map(|n| (n.id.clone(), n))
+            .collect();
+        let scoped_node_ids: BTreeSet<_> = old_nodes.keys().cloned().collect();
+        let old_edges: BTreeMap<String, Edge> = r
+            .edges_for_paths(&scopes, &scoped_node_ids)?
+            .into_iter()
+            .map(|e| (e.id.clone(), e))
+            .collect();
+        (old_nodes, old_edges, 0, 0)
+    };
     progress.advance(scopes.len(), None);
-    let incoming_ids: BTreeSet<_> = snapshot.nodes.iter().map(|n| n.id.clone()).collect();
-    if incoming_ids.len() != snapshot.nodes.len() {
-        return Err(AtlasError::invalid("duplicate node ID in snapshot"));
+    let mut incoming_ids = BTreeSet::new();
+    for node in &snapshot.nodes {
+        if !incoming_ids.insert(node.id.clone()) {
+            return Err(AtlasError::invalid(format!(
+                "duplicate node ID in snapshot: {}",
+                node.id
+            )));
+        }
     }
-    if snapshot
-        .edges
-        .iter()
-        .map(|e| &e.id)
-        .collect::<BTreeSet<_>>()
-        .len()
-        != snapshot.edges.len()
-    {
-        return Err(AtlasError::invalid("duplicate edge ID in snapshot"));
+    let mut incoming_edge_ids = BTreeSet::new();
+    for edge in &snapshot.edges {
+        if !incoming_edge_ids.insert(edge.id.clone()) {
+            return Err(AtlasError::invalid(format!(
+                "duplicate edge ID in snapshot: {}",
+                edge.id
+            )));
+        }
     }
     for node in &snapshot.nodes {
-        if node.id.is_empty() || !node.metadata.is_object() || !scopes.contains(&node.span.path) {
-            return Err(AtlasError::invalid(
-                "invalid node or node outside successful index scope",
-            ));
+        if node.id.is_empty() {
+            return Err(AtlasError::invalid("empty node ID in snapshot"));
+        }
+        if !node.metadata.is_object() {
+            return Err(AtlasError::invalid(format!(
+                "node {} metadata is not an object",
+                node.id
+            )));
+        }
+        if !scopes.contains(&node.span.path) {
+            return Err(AtlasError::invalid(format!(
+                "node {} path {} outside successful index scope",
+                node.id, node.span.path
+            )));
         }
     }
     let mut remap = BTreeMap::new();
@@ -2293,7 +2953,11 @@ fn apply_snapshot(
     }
     let node_total = snapshot.nodes.len();
     progress.phase("publishing", "write_nodes", Some(node_total), "items");
-    let mut prepared_nodes = Vec::with_capacity(node_total);
+    drop(old_by_semantic);
+    drop(old_by_fingerprint);
+    drop(protected_ids);
+    // Stream writes: never hold a second full copy of every prepared node.
+    let mut write_batch = Vec::with_capacity(WRITE_CHUNK);
     for (position, mut n) in snapshot.nodes.into_iter().enumerate() {
         if skipped.contains(&n.id) {
             continue;
@@ -2322,12 +2986,20 @@ fn apply_snapshot(
         }
         retained.insert(n.id.clone());
         let path = n.span.path.clone();
-        prepared_nodes.push(n);
-        if prepared_nodes.len() % 1024 == 0 || position + 1 == node_total {
+        write_batch.push(n);
+        if write_batch.len() >= WRITE_CHUNK {
+            r.put_nodes(&write_batch)?;
+            write_batch.clear();
+        }
+        if position % 1024 == 0 || position + 1 == node_total {
             progress.advance(position + 1, Some(&path));
         }
     }
-    r.put_nodes(&prepared_nodes)?;
+    if !write_batch.is_empty() {
+        r.put_nodes(&write_batch)?;
+        write_batch.clear();
+    }
+    drop(write_batch);
     // These are exactly the nodes visible in this transaction: the previous graph
     // plus successfully written nodes. Deletions happen after edge reconciliation.
     let mut available_nodes: BTreeSet<_> =
@@ -2475,7 +3147,7 @@ fn apply_snapshot(
     drop(unmatched_groups);
     let edge_total = incoming_edges.len();
     progress.phase("publishing", "write_edges", Some(edge_total), "items");
-    let mut prepared_edges = Vec::with_capacity(edge_total);
+    let mut edge_batch = Vec::with_capacity(WRITE_CHUNK);
     for (position, mut edge) in incoming_edges.into_iter().enumerate() {
         let path = edge.span.path.clone();
         if skipped_edges.contains(&edge.id) {
@@ -2505,18 +3177,28 @@ fn apply_snapshot(
             edge.revision = 1;
         }
         kept_edges.insert(edge.id.clone());
-        prepared_edges.push(edge);
-        if prepared_edges.len() % 1024 == 0 || position + 1 == edge_total {
+        edge_batch.push(edge);
+        if edge_batch.len() >= WRITE_CHUNK {
+            r.put_edges(&edge_batch)?;
+            edge_batch.clear();
+        }
+        if position % 1024 == 0 || position + 1 == edge_total {
             progress.advance(position + 1, Some(&path));
         }
     }
-    r.put_edges(&prepared_edges)?;
+    drop(edge_remap);
+    drop(skipped_edges);
+    if !edge_batch.is_empty() {
+        r.put_edges(&edge_batch)?;
+    }
+    drop(edge_batch);
     let deleted_nodes: Vec<_> = old_nodes
         .values()
         .filter(|n| scopes.contains(&n.span.path) && !retained.contains(&n.id))
         .map(|n| n.id.clone())
         .collect();
     let removed: BTreeSet<_> = deleted_nodes.iter().cloned().collect();
+    drop(old_nodes);
     let ambiguous_paths: BTreeSet<_> = snapshot
         .diagnostics
         .iter()
@@ -2537,6 +3219,7 @@ fn apply_snapshot(
         })
         .map(|edge| edge.id.clone())
         .collect();
+    drop(old_edges);
     let cleanup_total = deleted_nodes.len() + deleted_edges.len();
     progress.phase("publishing", "cleanup", Some(cleanup_total.max(1)), "items");
     progress.advance(0, None);
@@ -2571,8 +3254,8 @@ fn apply_snapshot(
     Ok(IndexReport {
         nodes: retained.len(),
         edges: kept_edges.len(),
-        deleted_nodes: deleted_nodes.len(),
-        deleted_edges: deleted_edges.len(),
+        deleted_nodes: deleted_nodes.len() + lean_deleted_nodes,
+        deleted_edges: deleted_edges.len() + lean_deleted_edges,
         diagnostics: diagnostics.len(),
     })
 }

@@ -33,6 +33,7 @@ volumes:
                     if not k.startswith(("ATLAS_", "POSTGRES_", "PG", "COMPOSE_"))}
         self.env.update({
             "ATLAS_IMAGE": "registry.example.invalid/team/code-atlas:contract",
+            "ATLAS_DB_IMAGE": "postgres:17-bookworm",
             "ATLAS_POSTGRES_PASSWORD": "atlas-test-quoted'password#[]",
             "ATLAS_AGENT_TOKEN": "contract-agent",
             "ATLAS_REVIEW_TOKEN": "contract-reviewer",
@@ -56,25 +57,30 @@ volumes:
         return json.loads(result.stdout)
 
     def assert_consumer(self, model):
+        self.assertIn("atlas-db", model["services"])
+        db = model["services"]["atlas-db"]
+        self.assertEqual(db["image"], self.env["ATLAS_DB_IMAGE"])
+        self.assertEqual(db["environment"]["POSTGRES_PASSWORD"],
+                         self.env["ATLAS_POSTGRES_PASSWORD"])
+        self.assertEqual(db["environment"]["POSTGRES_DB"], "atlas")
+        database = next(v for v in db["volumes"] if v["target"] == "/var/lib/postgresql/data")
+        self.assertEqual(database["source"], "atlas-postgres")
+        self.assertEqual(model["volumes"]["atlas-postgres"]["name"], "atlas-contract_atlas-postgres")
+
         atlas = model["services"]["atlas"]
         self.assertNotIn("build", atlas)
         self.assertEqual(atlas["image"], self.env["ATLAS_IMAGE"])
         self.assertNotIn("container_name", atlas)
-        self.assertNotIn("depends_on", atlas)
+        self.assertIn("atlas-db", atlas.get("depends_on", {}))
         env = atlas["environment"]
-        self.assertEqual(env["POSTGRES_PASSWORD"], self.env["ATLAS_POSTGRES_PASSWORD"])
-        self.assertEqual(env["PGPASSWORD"], env["POSTGRES_PASSWORD"])
-        self.assertEqual(env["PGUSER"], env["POSTGRES_USER"])
-        self.assertEqual(env["PGDATABASE"], env["POSTGRES_DB"])
-        self.assertEqual(env["POSTGRES_DB"], "atlas")
-        # The consumer must work even when the published image has no ENV defaults.
+        self.assertEqual(env["PGPASSWORD"], self.env["ATLAS_POSTGRES_PASSWORD"])
+        self.assertEqual(env["PGUSER"], env.get("PGUSER", "atlas"))
+        self.assertEqual(env["PGDATABASE"], "atlas")
         self.assertEqual(env.get("ATLAS_PROJECT_ROOT"), "/project")
         self.assertEqual(env.get("ATLAS_BIND"), "0.0.0.0:8080")
-        self.assertEqual(env.get("ATLAS_DATABASE_URL"), "host=127.0.0.1 connect_timeout=5")
+        self.assertEqual(env.get("ATLAS_DATABASE_URL"), "host=atlas-db connect_timeout=5")
         self.assertEqual(json.loads(env["ATLAS_ALLOWED_ORIGINS"]),
                          ["http://localhost:18080", "http://127.0.0.1:18080"])
-        # Analysis settings live in the project's .atlas/setup.yaml; passing a moved key
-        # would make atlas refuse to start next to that file.
         moved = {"ATLAS_WATCH_DIRS", "ATLAS_EXCLUDE", "ATLAS_INCLUDE_VENDOR",
                  "ATLAS_DECLARATION_PATHS", "ATLAS_LANGUAGE_PLUGINS", "ATLAS_FRAMEWORK_PLUGINS",
                  "ATLAS_PHP_VERSION", "ATLAS_MAX_FILE_BYTES", "ATLAS_MAX_ANALYSIS_BYTES",
@@ -86,9 +92,10 @@ volumes:
         self.assertEqual(Path(source["source"]), self.project)
         self.assertTrue(source["read_only"])
         self.assertFalse(source.get("bind", {}).get("create_host_path", False))
-        database = next(v for v in atlas["volumes"] if v["target"] == "/var/lib/postgresql/data")
-        self.assertEqual(database["source"], "atlas-postgres")
-        self.assertEqual(model["volumes"]["atlas-postgres"]["name"], "atlas-contract_atlas-postgres")
+        atlas_dir = next(v for v in atlas["volumes"] if v["target"] == "/project/.atlas")
+        self.assertEqual(Path(atlas_dir["source"]), self.project / ".atlas")
+        self.assertFalse(atlas_dir.get("read_only", False))
+        self.assertFalse(any(v["target"] == "/var/lib/postgresql/data" for v in atlas["volumes"]))
 
     def test_full_compose_installs_inside_unrelated_project_without_checkout(self):
         model = self.model(self.existing, ROOT / "docker-compose.yml")
@@ -104,19 +111,24 @@ volumes:
 
     def test_default_image_uses_owner_registry_and_never_builds(self):
         self.env.pop("ATLAS_IMAGE")
+        self.env.pop("ATLAS_DB_IMAGE")
         model = self.model(ROOT / "docker-compose.yml")
         atlas = model["services"]["atlas"]
-        self.assertEqual(atlas["image"], "drlenux/memory-tools:0.1.0")
+        self.assertEqual(atlas["image"], "drlenux/memory-tools:0.3.6")
+        self.assertEqual(model["services"]["atlas-db"]["image"],
+                         "postgres:17-bookworm")
         self.assertNotIn("build", atlas)
 
     def test_explicit_database_overrides_are_consistent(self):
         self.env.update(ATLAS_POSTGRES_DB="atlas_custom", ATLAS_POSTGRES_USER="atlas_custom_user")
         for file in [ROOT / "docker-compose.yml", ROOT / "examples/compose.atlas.yml"]:
-            env = self.model(file)["services"]["atlas"]["environment"]
-            self.assertEqual(env["POSTGRES_DB"], env["PGDATABASE"])
-            self.assertEqual(env["POSTGRES_DB"], "atlas_custom")
-            self.assertEqual(env["POSTGRES_USER"], env["PGUSER"])
-            self.assertEqual(env["POSTGRES_USER"], "atlas_custom_user")
+            model = self.model(file)
+            db = model["services"]["atlas-db"]["environment"]
+            app = model["services"]["atlas"]["environment"]
+            self.assertEqual(db["POSTGRES_DB"], "atlas_custom")
+            self.assertEqual(db["POSTGRES_USER"], "atlas_custom_user")
+            self.assertEqual(app["PGDATABASE"], "atlas_custom")
+            self.assertEqual(app["PGUSER"], "atlas_custom_user")
 
     def test_indexing_workers_are_forwarded_in_both_consumer_recipes(self):
         for file in [ROOT / "docker-compose.yml", ROOT / "examples/compose.atlas.yml"]:
@@ -140,6 +152,7 @@ volumes:
         model = self.model(ROOT / "docker-compose.build.yml", project=ROOT)
         atlas = model["services"]["atlas"]
         self.assertEqual(atlas["image"], self.env["ATLAS_IMAGE"])
+        self.assertNotIn("atlas-db", model["services"])
         self.assertEqual(Path(atlas["build"]["context"]), ROOT)
         self.assertNotIn("environment", atlas)
         self.assertNotIn("volumes", atlas)

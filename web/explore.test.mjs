@@ -44,6 +44,9 @@ test('search groups map to valid node kinds', () => {
   }
   assert.deepEqual(SEARCH_GROUPS.find(g => g.id === 'writes').kinds, ['write_site']);
   assert.deepEqual(SEARCH_GROUPS.find(g => g.id === 'all').kinds, []);
+  assert.deepEqual(SEARCH_GROUPS.find(g => g.id === 'sql').kinds, ['sql_site']);
+  assert.ok(SEARCH_GROUPS.find(g => g.id === 'tables').kinds.includes('table'));
+  assert.ok(SEARCH_GROUPS.find(g => g.id === 'config').kinds.includes('route'));
 });
 
 function node(id, kind, name, metadata = {}) {
@@ -153,4 +156,54 @@ test('contextView groups queue dispatches in both directions', () => {
   assert.equal(view.incoming.dispatches.length, 1);
   assert.equal(view.incoming.dispatches[0].owner.id, 'method:P::run');
   assert.equal(view.incoming.dispatches[0].queue, 'queueGame');
+});
+
+test('contextView groups sql edges and type relations', () => {
+  const M = 'method:W::pay';
+  const S = 'sql_site:method:W::pay:sql_site:php-struct-v1:1:1';
+  const T = 'table:public.wallet';
+  const view = contextView({
+    root_id: M,
+    truncated: false,
+    diagnostics: [],
+    nodes: [
+      node('class:W', 'class', 'W'),
+      node(M, 'method', 'pay'),
+      node(S, 'sql_site', 'UPDATE wallet'),
+      node(T, 'table', 'wallet'),
+      node('class:Base', 'class', 'Base'),
+    ],
+    edges: [
+      edge('contains', 'class:W', M),
+      edge('inherits', 'class:W', 'class:Base'),
+      edge('contains', M, S),
+      edge('sql_reads', S, T),
+      edge('sql_writes', S, T),
+    ],
+  });
+  assert.equal(view.effects.sql_reads.length, 1);
+  assert.equal(view.effects.sql_reads[0].target.id, T);
+  assert.equal(view.effects.sql_writes.length, 1);
+  assert.equal(view.relations.some(r => r.kind === 'inherits'), false, 'inherits is on class, not method root');
+
+  const table = contextView({
+    root_id: T,
+    truncated: false,
+    diagnostics: [],
+    nodes: [node(T, 'table', 'wallet'), node(S, 'sql_site', 'UPDATE wallet'), node(M, 'method', 'pay')],
+    edges: [edge('sql_reads', S, T), edge('contains', M, S)],
+  });
+  assert.equal(table.incoming.sql_reads.length, 1);
+  assert.equal(table.incoming.sql_reads[0].owner.id, M);
+
+  const klass = contextView({
+    root_id: 'class:W',
+    truncated: false,
+    diagnostics: [],
+    nodes: [node('class:W', 'class', 'W'), node('class:Base', 'class', 'Base')],
+    edges: [edge('inherits', 'class:W', 'class:Base')],
+  });
+  assert.equal(klass.relations.length, 1);
+  assert.equal(klass.relations[0].kind, 'inherits');
+  assert.equal(klass.relations[0].node.id, 'class:Base');
 });

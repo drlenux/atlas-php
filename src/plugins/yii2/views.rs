@@ -24,6 +24,25 @@ pub(super) fn enrich_views(
         .collect();
 
     let mut renders: Vec<RenderFact> = Vec::new();
+    // Flow file-scope now analyzes top-level `$this->render`; token-scan is fallback
+    // only for view paths that still lack a render call_site.
+    let flow_render_paths: BTreeSet<String> = graph
+        .edges
+        .iter()
+        .filter(|e| e.kind == "calls")
+        .filter(|e| {
+            let member = e.metadata["member_name"].as_str().unwrap_or("");
+            RENDER_METHODS
+                .iter()
+                .any(|m| member.eq_ignore_ascii_case(m))
+        })
+        .map(|e| e.span.path.clone())
+        .collect();
+    renders.extend(
+        scan_view_source_renders(files, graph, &controller_paths, &file_paths, options)?
+            .into_iter()
+            .filter(|fact| !flow_render_paths.contains(&fact.path)),
+    );
     for edge in graph.edges.iter().filter(|e| e.kind == "calls") {
         options.check(graph.nodes.len() + graph.edges.len())?;
         let member = edge.metadata["member_name"].as_str().unwrap_or("");
@@ -44,8 +63,9 @@ pub(super) fn enrich_views(
         };
         let params = params_from_args(edge.metadata["arguments"].as_array());
         let receiver = edge.metadata["receiver_class"].as_str().unwrap_or("");
-        let owner =
-            enclosing_controller(graph, &edge.from).or_else(|| class_if_controller(receiver));
+        let owner = enclosing_controller(graph, &edge.from)
+            .or_else(|| class_if_controller(receiver))
+            .or_else(|| controller_owning_view_file(graph, &edge.span.path));
         let candidates = resolve_view_paths(
             &view_name,
             member,
@@ -66,32 +86,25 @@ pub(super) fn enrich_views(
             params,
             candidates,
             method: member.to_owned(),
+            controller: owner,
         });
     }
 
     for fact in &renders {
         options.check(graph.nodes.len() + graph.edges.len())?;
+        // Token-scan facts use `from: view:{path}`; ensure that source node exists
+        // even when no controller `render` created it yet (nested-only views).
+        if let Some(source_path) = fact.from.strip_prefix("view:") {
+            ensure_view_node(graph, source_path);
+            if let Some(controller) = &fact.controller {
+                ensure_view_owned(graph, fact, source_path, controller);
+            }
+        }
         for view_path in &fact.candidates {
             let view_id = format!("view:{view_path}");
-            if !graph.nodes.iter().any(|n| n.id == view_id) {
-                graph.nodes.push(Node {
-                    id: view_id.clone(),
-                    kind: "view".into(),
-                    name: view_path.rsplit('/').next().unwrap_or(view_path).to_owned(),
-                    qualified_name: view_path.clone(),
-                    span: SourceSpan {
-                        path: view_path.clone(),
-                        start_line: 1,
-                        end_line: 1,
-                    },
-                    metadata: json!({
-                        "framework": "yii2",
-                        "path": view_path,
-                        "commented": false,
-                    }),
-                    trust: 1,
-                    revision: 0,
-                });
+            ensure_view_node(graph, view_path);
+            if let Some(controller) = &fact.controller {
+                ensure_view_owned(graph, fact, view_path, controller);
             }
             let edge_id = format!("edge:renders:{}:{view_id}:{}", fact.call_id, fact.line);
             if graph.edges.iter().any(|e| e.id == edge_id) {
@@ -121,7 +134,428 @@ pub(super) fn enrich_views(
             inject_view_params(graph, view_path, &view_id, &fact.params, fact);
         }
     }
+    // `$this->layout = 'main'` / writes to layout → layouts/<name>.php owned by controller.
+    link_layout_views(graph, &file_paths, &controller_paths);
+    // Nested `$this->render` inside a view inherits the controller that owns the parent view.
+    propagate_view_ownership(graph);
     Ok(())
+}
+
+fn propagate_view_ownership(graph: &mut GraphSnapshot) {
+    let mut pending: Vec<(String, String, String, usize, String)> = Vec::new();
+    for edge in graph.edges.iter().filter(|e| e.kind == "renders") {
+        let Some(view_id) = edge.to.clone() else {
+            continue;
+        };
+        let owned = graph.edges.iter().any(|e| {
+            e.kind == "contains"
+                && e.to.as_deref() == Some(view_id.as_str())
+                && e.from.starts_with("class:")
+        });
+        if owned {
+            continue;
+        }
+        let Some(controller) = controller_owning_view_file(graph, &edge.span.path) else {
+            continue;
+        };
+        pending.push((
+            format!("class:{controller}"),
+            view_id,
+            edge.span.path.clone(),
+            edge.span.start_line,
+            controller,
+        ));
+    }
+    for (class_id, view_id, path, line, controller) in pending {
+        if !graph.nodes.iter().any(|n| n.id == class_id) {
+            continue;
+        }
+        let owns_id = format!("edge:contains:{class_id}:{view_id}");
+        if graph.edges.iter().any(|e| e.id == owns_id) {
+            continue;
+        }
+        graph.edges.push(Edge {
+            id: owns_id,
+            kind: "contains".into(),
+            from: class_id,
+            to: Some(view_id),
+            span: SourceSpan {
+                path,
+                start_line: line,
+                end_line: line,
+            },
+            metadata: json!({
+                "framework": "yii2",
+                "framework_evidence": "nested_render",
+                "controller": controller,
+                "resolution": "resolved",
+            }),
+            trust: 1,
+            revision: 0,
+        });
+    }
+}
+
+fn ensure_view_node(graph: &mut GraphSnapshot, view_path: &str) {
+    let view_id = format!("view:{view_path}");
+    if graph.nodes.iter().any(|n| n.id == view_id) {
+        return;
+    }
+    graph.nodes.push(Node {
+        id: view_id,
+        kind: "view".into(),
+        name: view_path.rsplit('/').next().unwrap_or(view_path).to_owned(),
+        qualified_name: view_path.to_owned(),
+        span: SourceSpan {
+            path: view_path.to_owned(),
+            start_line: 1,
+            end_line: 1,
+        },
+        metadata: json!({
+            "framework": "yii2",
+            "path": view_path,
+            "commented": false,
+        }),
+        trust: 1,
+        revision: 0,
+    });
+}
+
+fn ensure_view_owned(
+    graph: &mut GraphSnapshot,
+    fact: &RenderFact,
+    view_path: &str,
+    controller: &str,
+) {
+    let class_id = format!("class:{controller}");
+    if !graph.nodes.iter().any(|n| n.id == class_id) {
+        return;
+    }
+    let view_id = format!("view:{view_path}");
+    let owns_id = format!("edge:contains:{class_id}:{view_id}");
+    if graph.edges.iter().any(|e| e.id == owns_id) {
+        return;
+    }
+    graph.edges.push(Edge {
+        id: owns_id,
+        kind: "contains".into(),
+        from: class_id,
+        to: Some(view_id),
+        span: SourceSpan {
+            path: fact.path.clone(),
+            start_line: fact.line,
+            end_line: fact.line,
+        },
+        metadata: json!({
+            "framework": "yii2",
+            "framework_evidence": "render",
+            "view": fact.view_name,
+            "resolution": if fact.candidates.len() == 1 {
+                "resolved"
+            } else {
+                "candidate"
+            },
+        }),
+        trust: 1,
+        revision: 0,
+    });
+}
+
+fn scan_view_source_renders(
+    files: &[SourceFile],
+    graph: &GraphSnapshot,
+    controller_paths: &BTreeMap<String, String>,
+    file_paths: &BTreeSet<String>,
+    options: &AnalysisOptions,
+) -> Result<Vec<RenderFact>, String> {
+    use crate::plugins::php::tokens::{tokenize, TokenKind};
+    let mut out = Vec::new();
+    for file in files
+        .iter()
+        .filter(|f| f.path.contains("/views/") || f.path.contains("/themes/"))
+    {
+        options.check(out.len())?;
+        let Ok(tokens) = tokenize(&file.source, options) else {
+            continue;
+        };
+        let mut i = 0;
+        while i + 4 < tokens.len() {
+            // $this->render('x' / $this->renderPartial(
+            let is_this = tokens[i].kind == TokenKind::Variable
+                && tokens[i].text.eq_ignore_ascii_case("$this");
+            if !(is_this
+                && tokens[i + 1].text == "->"
+                && tokens[i + 2].kind == TokenKind::Ident
+                && tokens[i + 3].text == "(")
+            {
+                i += 1;
+                continue;
+            }
+            let method = tokens[i + 2].text.to_ascii_lowercase();
+            if !RENDER_METHODS.contains(&method.as_str()) {
+                i += 1;
+                continue;
+            }
+            let arg = &tokens[i + 4];
+            let Some(view_name) = matches!(arg.kind, TokenKind::String)
+                .then(|| string_literal_at_start(&arg.text))
+                .flatten()
+            else {
+                i += 1;
+                continue;
+            };
+            let controller = controller_owning_view_file(graph, &file.path)
+                .or_else(|| controller_from_view_path(&file.path, controller_paths));
+            let candidates = resolve_view_paths(
+                &view_name,
+                &method,
+                controller.as_deref(),
+                &file.path,
+                controller_paths,
+                file_paths,
+            );
+            if candidates.is_empty() {
+                i += 1;
+                continue;
+            }
+            out.push(RenderFact {
+                from: format!("view:{}", file.path),
+                call_id: format!("view-src:{}:{}:{method}", file.path, arg.line),
+                path: file.path.clone(),
+                line: arg.line.max(1),
+                view_name,
+                params: Vec::new(),
+                candidates,
+                method,
+                controller,
+            });
+            i += 5;
+        }
+    }
+    Ok(out)
+}
+
+fn controller_from_view_path(
+    path: &str,
+    controller_paths: &BTreeMap<String, String>,
+) -> Option<String> {
+    // partner/views/site/index.php → partner\controllers\SiteController
+    // partner/themes/slot/site/index.php → partner\controllers\SiteController
+    let path = path.replace('\\', "/");
+    let (app, rest) = if let Some(r) = path.split_once("/views/") {
+        r
+    } else if let Some((app, after)) = path.split_once("/themes/") {
+        let rest = after.split_once('/')?.1; // drop theme domain
+        (app, rest)
+    } else {
+        return None;
+    };
+    let folder = rest.split('/').next()?.to_owned();
+    if folder.is_empty() || folder == "layouts" {
+        return None;
+    }
+    // my-bonus → MyBonusController
+    let class_short = folder
+        .split('-')
+        .map(|p| {
+            let mut c = p.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().chain(c).collect::<String>(),
+                None => String::new(),
+            }
+        })
+        .collect::<String>()
+        + "Controller";
+    let qn = format!("{app}\\controllers\\{class_short}").replace('/', "\\");
+    if controller_paths.contains_key(&qn) {
+        return Some(qn);
+    }
+    // Case-insensitive match on short name.
+    controller_paths
+        .keys()
+        .find(|k| {
+            k.rsplit('\\').next().is_some_and(|short| {
+                short.eq_ignore_ascii_case(&class_short)
+                    && k.to_ascii_lowercase().contains(&format!(
+                        "\\controllers\\{}",
+                        class_short.to_ascii_lowercase()
+                    ))
+            })
+        })
+        .cloned()
+}
+
+fn controller_owning_view_file(graph: &GraphSnapshot, path: &str) -> Option<String> {
+    let view_id = format!("view:{path}");
+    graph.edges.iter().find_map(|e| {
+        (e.kind == "contains"
+            && e.to.as_deref() == Some(view_id.as_str())
+            && e.from.starts_with("class:")
+            && e.from.contains("Controller"))
+        .then(|| e.from.strip_prefix("class:").unwrap_or(&e.from).to_owned())
+    })
+}
+
+fn link_layout_views(
+    graph: &mut GraphSnapshot,
+    files: &BTreeSet<String>,
+    controller_paths: &BTreeMap<String, String>,
+) {
+    #[derive(Clone)]
+    struct LayoutFact {
+        from: String,
+        edge_id: String,
+        path: String,
+        line: usize,
+        name: String,
+        controller: String,
+    }
+    let facts: Vec<LayoutFact> = graph
+        .edges
+        .iter()
+        .filter(|e| {
+            matches!(e.kind.as_str(), "writes" | "property_access")
+                && e.metadata["member_name"]
+                    .as_str()
+                    .is_some_and(|m| m.eq_ignore_ascii_case("layout"))
+        })
+        .filter_map(|edge| {
+            let raw = edge.metadata["value_expression"]
+                .as_str()
+                .or_else(|| edge.metadata["value_constant"].as_str())
+                .unwrap_or("");
+            let name = literal_layout_name(raw)?;
+            let controller = enclosing_controller(graph, &edge.from).or_else(|| {
+                edge.metadata["receiver_class"]
+                    .as_str()
+                    .and_then(class_if_controller)
+            })?;
+            Some(LayoutFact {
+                from: edge.from.clone(),
+                edge_id: edge.id.clone(),
+                path: edge.span.path.clone(),
+                line: edge.span.start_line,
+                name,
+                controller,
+            })
+        })
+        .collect();
+    for fact in facts {
+        let ctrl_file = controller_paths.get(&fact.controller).map(String::as_str);
+        let bases = controller_view_bases(&fact.controller, ctrl_file);
+        let layout = name_from_layout(&fact.name);
+        let mut candidates = Vec::new();
+        for base in bases {
+            if let Some((app_views, _)) = base.rsplit_once('/') {
+                push_existing(
+                    &mut candidates,
+                    &format!("{app_views}/layouts/{layout}.php"),
+                    files,
+                );
+            }
+            if let Some(app) = app_root_from_views_base(&base) {
+                push_existing(
+                    &mut candidates,
+                    &format!("{app}/views/layouts/{layout}.php"),
+                    files,
+                );
+            }
+        }
+        for view_path in candidates {
+            let view_id = format!("view:{view_path}");
+            if !graph.nodes.iter().any(|n| n.id == view_id) {
+                graph.nodes.push(Node {
+                    id: view_id.clone(),
+                    kind: "view".into(),
+                    name: view_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&view_path)
+                        .to_owned(),
+                    qualified_name: view_path.clone(),
+                    span: SourceSpan {
+                        path: view_path.clone(),
+                        start_line: 1,
+                        end_line: 1,
+                    },
+                    metadata: json!({
+                        "framework": "yii2",
+                        "path": view_path,
+                        "layout": true,
+                        "commented": false,
+                    }),
+                    trust: 1,
+                    revision: 0,
+                });
+            }
+            let class_id = format!("class:{}", fact.controller);
+            let owns_id = format!("edge:contains:{class_id}:{view_id}");
+            if graph.nodes.iter().any(|n| n.id == class_id)
+                && !graph.edges.iter().any(|e| e.id == owns_id)
+            {
+                graph.edges.push(Edge {
+                    id: owns_id,
+                    kind: "contains".into(),
+                    from: class_id,
+                    to: Some(view_id.clone()),
+                    span: SourceSpan {
+                        path: fact.path.clone(),
+                        start_line: fact.line,
+                        end_line: fact.line,
+                    },
+                    metadata: json!({
+                        "framework": "yii2",
+                        "framework_evidence": "layout",
+                        "view": fact.name,
+                        "resolution": "resolved",
+                    }),
+                    trust: 1,
+                    revision: 0,
+                });
+            }
+            let edge_id = format!("edge:renders:{}:{view_id}:{}", fact.edge_id, fact.line);
+            if !graph.edges.iter().any(|e| e.id == edge_id) {
+                graph.edges.push(Edge {
+                    id: edge_id,
+                    kind: "renders".into(),
+                    from: fact.from.clone(),
+                    to: Some(view_id),
+                    span: SourceSpan {
+                        path: fact.path.clone(),
+                        start_line: fact.line,
+                        end_line: fact.line,
+                    },
+                    metadata: json!({
+                        "framework": "yii2",
+                        "framework_evidence": "layout",
+                        "view": fact.name,
+                        "resolution": "resolved",
+                    }),
+                    trust: 1,
+                    revision: 0,
+                });
+            }
+        }
+    }
+}
+
+fn literal_layout_name(raw: &str) -> Option<String> {
+    let t = raw.trim().trim_end_matches(';').trim();
+    let bytes = t.as_bytes();
+    if bytes.len() >= 2
+        && (bytes[0] == b'\'' || bytes[0] == b'"')
+        && bytes[0] == bytes[bytes.len() - 1]
+    {
+        let inner = &t[1..t.len() - 1];
+        return (!inner.is_empty()).then(|| inner.to_owned());
+    }
+    None
+}
+
+fn name_from_layout(name: &str) -> &str {
+    name.trim_start_matches('/')
+        .trim_start_matches("layouts/")
+        .trim_end_matches(".php")
 }
 
 struct RenderFact {
@@ -133,6 +567,7 @@ struct RenderFact {
     params: Vec<Param>,
     candidates: Vec<String>,
     method: String,
+    controller: Option<String>,
 }
 
 #[derive(Clone)]

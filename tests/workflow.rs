@@ -80,6 +80,9 @@ async fn native_php_to_mcp_correction_reindex_review_and_analytics() {
             grep_excludes: vec![],
             read_excludes: vec![],
             areas: vec![],
+            log: Default::default(),
+            mcp_hook: Default::default(),
+            omit_resolutions: vec![],
         },
     );
     let id = "method:App\\Shop::choose";

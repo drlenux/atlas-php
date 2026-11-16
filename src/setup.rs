@@ -47,6 +47,9 @@ pub struct SetupFile {
     pub tests: TestsSection,
     #[serde(default)]
     pub mcp: McpSection,
+    /// Optional file log of parse gaps and/or MCP/HTTP traffic.
+    #[serde(default)]
+    pub logging: LoggingSection,
     /// Prefix → folders of an application (label, Yii context, namespace-less names).
     #[serde(default)]
     pub areas: BTreeMap<String, AreaSection>,
@@ -101,6 +104,31 @@ pub struct McpSection {
     pub max_context_nodes: Option<u64>,
     pub max_context_depth: Option<u64>,
     pub max_request_bytes: Option<u64>,
+    /// Optional bash script: stdin = tool text, stdout = replacement (`ATLAS_MCP_TOOL` set).
+    pub response_script: Option<String>,
+    /// Script timeout seconds (1–30, default 5).
+    pub response_script_timeout_secs: Option<u64>,
+    /// Drop MCP text lines whose `[resolution]` is in this list (e.g. unresolved, candidate,
+    /// name_only). Omitted: `config::DEFAULT_OMIT_RESOLUTIONS`; `[]` shows everything.
+    pub omit_resolutions: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoggingSection {
+    /// Relative path under the project root (e.g. `.atlas/atlas.log`).
+    pub file: Option<String>,
+    #[serde(default)]
+    pub parse_errors: bool,
+    #[serde(default)]
+    pub parse_skips: bool,
+    /// When parse_skips is on, also log `declaration_only` vendor skips (noisy).
+    #[serde(default)]
+    pub declaration_skips: bool,
+    #[serde(default)]
+    pub requests: bool,
+    #[serde(default)]
+    pub responses: bool,
 }
 
 /// `php_version: 8.2` (a YAML number) or `"8.2"`.
@@ -195,6 +223,47 @@ impl SetupFile {
         values
     }
 
+    /// File logging settings; paths stay inside the project.
+    pub fn logging(&self, project_root: &Path) -> Result<crate::logging::LoggingConfig, String> {
+        let section = &self.logging;
+        let any =
+            section.parse_errors || section.parse_skips || section.requests || section.responses;
+        if !any {
+            return Ok(crate::logging::LoggingConfig::default());
+        }
+        let Some(relative) = section
+            .file
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Err(format!(
+                "logging.file in {SETUP_PATH} is required when parse_errors, parse_skips, requests or responses is true"
+            ));
+        };
+        if !relative_file(relative) {
+            return Err(format!(
+                "logging.file in {SETUP_PATH} must be a relative path inside the project"
+            ));
+        }
+        Ok(crate::logging::LoggingConfig {
+            file: Some(project_root.join(relative)),
+            parse_errors: section.parse_errors,
+            parse_skips: section.parse_skips,
+            declaration_skips: section.declaration_skips,
+            requests: section.requests,
+            responses: section.responses,
+        })
+    }
+
+    pub fn mcp_hook(&self, project_root: &Path) -> Result<crate::mcp_hook::McpHook, String> {
+        crate::mcp_hook::McpHook::from_setup(
+            project_root,
+            self.mcp.response_script.as_deref(),
+            self.mcp.response_script_timeout_secs,
+        )
+    }
+
     /// Validated areas, ordered by prefix.
     pub fn areas(&self) -> Result<Vec<crate::domain::Area>, String> {
         let mut areas = Vec::new();
@@ -260,6 +329,16 @@ fn relative_folder(value: &str) -> bool {
         && !Path::new(value)
             .components()
             .any(|c| !matches!(c, std::path::Component::Normal(_)))
+}
+
+fn relative_file(value: &str) -> bool {
+    relative_folder(value)
+        || (!value.is_empty()
+            && !Path::new(value).is_absolute()
+            && Path::new(value)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            && Path::new(value).file_name().is_some())
 }
 
 fn concat(first: &[String], second: &[String]) -> Vec<String> {

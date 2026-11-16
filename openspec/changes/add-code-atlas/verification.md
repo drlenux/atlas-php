@@ -1,5 +1,11 @@
 # Проверка реализации v0.5
 
+## Изоляция паник и Class::method (2026-11-13, R1)
+
+TDD: красные до реализации — `panic_in_a_tool_call_is_an_error_result_and_the_service_keeps_working`, `panic_in_a_reviewer_route_is_a_storage_error_not_a_lost_service`, `poisoned_service_lock_is_recovered_for_mcp_and_reviewer_calls` (`tests/http.rs`), `class_method_symbol_search_finds_declaration_and_only_that_receivers_calls` (`tests/search_modes.rs`) и `postgres_class_method_search_works_in_every_mode` (реальный PostgreSQL 17, одноразовый контейнер). Регрессии UTF-8 в `src/logging.rs` (`redacted_traffic_never_splits_a_codepoint_at_the_16k_limit`, `long_cyrillic_response_is_logged_without_panicking`) зелёные на текущем коде; при возврате `max` вместо `floor_char_boundary` падают с исходной паникой. Старый дефект SQL `'[^\\]*$'` в текущем дереве отсутствует (`[^:]*$`).
+
+Известные пробелы: `postgres_search_filters_kinds_and_walks_keyset_cursor` падает из-за легаси bare-id курсора при ранжировании по score (не связано с R1); `native_php::commented_call_becomes_commented_occurrence` падает в незакоммиченных правках PHP-анализа. Паника внутри открытой транзакции PostgreSQL не проверялась на реальной БД.
+
 ## Удаление Git-provenance (2026-11-05)
 
 По запросу владельца убраны модуль `git`/`git_native`, стадия индексации, `metadata.git`, watcher `<git-head>`, zlib в образе, UI-этап Git и требования GIT-*. На probe-проекте после пересборки `drlenux/memory-tools:probe-local`: ответ `atlas_context` **~137 KiB** вместо ~294 KiB, `git_fields=0`, в логах нет `stage=git/history`. `cargo test`, Clippy, Node, strict OpenSpec пройдены. Каталог `.git` по-прежнему не индексируется как исходный код.

@@ -77,9 +77,10 @@ fn analyzer_and_yii2_work_with_no_external_programs_in_path() {
 }
 
 #[test]
-fn runtime_image_has_only_atlas_and_postgres_application_processes() {
+fn runtime_images_split_app_and_stock_postgres_without_language_runtimes() {
     let docker = include_str!("../Dockerfile");
-    let runtime = docker.split("FROM pgvector/").nth(1).unwrap();
+    assert!(docker.contains("FROM debian:bookworm-slim"));
+    assert!(!docker.contains("pgvector") && !docker.contains("AS atlas-db"));
     for forbidden in [
         "php-cli",
         "php-mbstring",
@@ -93,13 +94,16 @@ fn runtime_image_has_only_atlas_and_postgres_application_processes() {
         "curl",
     ] {
         assert!(
-            !runtime.contains(forbidden),
-            "unexpected runtime dependency: {forbidden}"
+            !docker.contains(forbidden),
+            "unexpected app dependency: {forbidden}"
         );
     }
     assert!(!docker.contains("FROM composer:"));
     let compose = include_str!("../docker-compose.yml");
-    // Plugins are project settings now (.atlas/setup.yaml), not container environment.
+    assert!(compose.contains("atlas-db:") && compose.contains("host=atlas-db"));
+    assert!(compose.contains("postgres:17-bookworm"));
+    assert!(!compose.contains("memory-tools-db"));
+    assert!(!compose.contains("pgvector/"));
     assert!(
         !compose.contains("ATLAS_LANGUAGE_PLUGINS") && !compose.contains("ATLAS_FRAMEWORK_PLUGINS")
     );

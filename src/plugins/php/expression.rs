@@ -52,6 +52,11 @@ pub enum Kind {
     },
     Binary(String, Box<Expr>, Box<Expr>),
     Unary(String, Box<Expr>),
+    /// `match ($x) { 1 => $a, default => $b }` — arms are result expressions only.
+    Match {
+        subject: Box<Expr>,
+        arms: Vec<Expr>,
+    },
     Unknown(Vec<Expr>),
 }
 
@@ -72,6 +77,10 @@ fn parse_depth(u: &Unit, start: usize, end: usize, depth: usize) -> Result<Expr,
         return Err("missing expression".into());
     }
     let wrap = |kind| Expr { start, end, kind };
+    // `static fn` / `static function` — Closure token must be fn/function for syntax map.
+    if u.is(start, "static") && (u.is(start + 1, "fn") || u.is(start + 1, "function")) {
+        return Ok(wrap(Kind::Closure(start + 1)));
+    }
     if u.is(start, "function") || u.is(start, "fn") {
         return Ok(wrap(Kind::Closure(start)));
     }
@@ -91,7 +100,7 @@ fn parse_depth(u: &Unit, start: usize, end: usize, depth: usize) -> Result<Expr,
             expr: Box::new(parse_depth(u, close + 1, end, depth + 1)?),
         }));
     }
-    if ["!", "-", "+", "clone", "throw", "@"]
+    if ["!", "-", "+", "~", "clone", "throw", "@", "++", "--"]
         .iter()
         .any(|s| u.is(start, s))
     {
@@ -99,6 +108,16 @@ fn parse_depth(u: &Unit, start: usize, end: usize, depth: usize) -> Result<Expr,
             u.tokens[start].text.clone(),
             Box::new(parse_depth(u, start + 1, end, depth + 1)?),
         )));
+    }
+    // Argument unpacking / yield-from-style spread: `...$items`.
+    if u.is(start, "...") {
+        return Ok(wrap(Kind::Unary(
+            "...".into(),
+            Box::new(parse_depth(u, start + 1, end, depth + 1)?),
+        )));
+    }
+    if u.is(start, "match") && u.is(start + 1, "(") {
+        return parse_match(u, start, end, depth);
     }
     if u.is(start, "new") {
         let name = u
@@ -190,13 +209,19 @@ fn parse_depth(u: &Unit, start: usize, end: usize, depth: usize) -> Result<Expr,
         if u.is(next, "->") || u.is(next, "?->") || u.is(next, "::") {
             let static_ = u.is(next, "::");
             let nullsafe = u.is(next, "?->");
-            let token = u
-                .tokens
-                .get(next + 1)
-                .ok_or("missing member after access operator")?;
-            let member = token.text.clone();
-            let dynamic = token.kind == TokenKind::Variable && !static_;
-            let after = next + 2;
+            // `$obj->{$expr}` / `$obj->{"name_$x"}` — curly dynamic member.
+            let (member, dynamic, after) = if u.is(next + 1, "{") {
+                let close = u.pairs[next + 1].ok_or("unclosed dynamic member")?;
+                let _ = parse_depth(u, next + 2, close, depth + 1)?;
+                (u.text(next + 1, close + 1), true, close + 1)
+            } else {
+                let token = u
+                    .tokens
+                    .get(next + 1)
+                    .ok_or("missing member after access operator")?;
+                let dynamic = token.kind == TokenKind::Variable && !static_;
+                (token.text.clone(), dynamic, next + 2)
+            };
             if u.is(after, "(") {
                 let close = u.pairs[after].unwrap();
                 let args = arguments(u, after + 1, close, depth + 1)?;
@@ -244,6 +269,15 @@ fn parse_depth(u: &Unit, start: usize, end: usize, depth: usize) -> Result<Expr,
                 },
             };
             next = close + 1;
+            continue;
+        }
+        if u.is(next, "++") || u.is(next, "--") {
+            expr = Expr {
+                start,
+                end: next + 1,
+                kind: Kind::Unary(u.tokens[next].text.clone(), Box::new(expr)),
+            };
+            next += 1;
             continue;
         }
         // One Unknown for the unsupported remainder; keep the already-parsed left side.
@@ -424,9 +458,13 @@ fn precedence(u: &Unit, i: usize) -> (usize, bool) {
         "??" => (6, true),
         "||" => (7, false),
         "&&" => (8, false),
-        "==" | "!=" | "===" | "!==" | "<" | ">" | "<=" | ">=" => (9, false),
-        "." | "+" | "-" => (10, false),
-        "*" | "/" | "%" => (11, false),
+        "|" => (9, false),
+        "^" => (10, false),
+        "&" => (11, false),
+        "==" | "!=" | "===" | "!==" | "<" | ">" | "<=" | ">=" | "<=>" | "instanceof" => (12, false),
+        "<<" | ">>" => (13, false),
+        "." | "+" | "-" => (14, false),
+        "*" | "/" | "%" => (15, false),
         _ => (usize::MAX, false),
     }
 }
@@ -447,10 +485,17 @@ fn trailing_operator(u: &Unit, i: usize) -> bool {
             | "&&"
             | "and"
             | "xor"
+            | "|"
+            | "^"
+            | "&"
+            | "<<"
+            | ">>"
             | "=="
             | "!="
             | "==="
             | "!=="
+            | "<=>"
+            | "instanceof"
             | "<"
             | ">"
             | "<="
@@ -505,9 +550,63 @@ fn arguments(u: &Unit, start: usize, end: usize, depth: usize) -> Result<Vec<Exp
         if a >= b {
             continue;
         }
-        result.push(parse_depth(u, a, b, depth + 1)?);
+        // PHP 8 named args: `userId: $x` — label is not part of the value expression.
+        let value_start = if a + 1 < b && u.tokens[a].kind == TokenKind::Ident && u.is(a + 1, ":") {
+            a + 2
+        } else {
+            a
+        };
+        if value_start >= b {
+            return Err("missing named argument value".into());
+        }
+        result.push(parse_depth(u, value_start, b, depth + 1)?);
     }
     Ok(result)
+}
+
+fn parse_match(u: &Unit, start: usize, end: usize, depth: usize) -> Result<Expr, String> {
+    let close_paren = u.pairs[start + 1].ok_or("unclosed match subject")?;
+    let subject = Box::new(parse_depth(u, start + 2, close_paren, depth + 1)?);
+    if !u.is(close_paren + 1, "{") {
+        return Err("match requires a body".into());
+    }
+    let close_brace = u.pairs[close_paren + 1].ok_or("unclosed match body")?;
+    if close_brace + 1 > end {
+        return Err("match body exceeds expression span".into());
+    }
+    let mut arms = Vec::new();
+    for (a, b) in u.split(close_paren + 2, close_brace, ",") {
+        if a >= b {
+            continue;
+        }
+        let mut arrow = None;
+        let mut i = a;
+        while i < b {
+            if u.is(i, "=>") {
+                arrow = Some(i);
+                break;
+            }
+            if let Some(close) = u.pairs[i] {
+                if close > i {
+                    i = close + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        let Some(arrow) = arrow else {
+            return Err("match arm requires =>".into());
+        };
+        if arrow + 1 >= b {
+            return Err("missing match arm value".into());
+        }
+        arms.push(parse_depth(u, arrow + 1, b, depth + 1)?);
+    }
+    Ok(Expr {
+        start,
+        end: close_brace + 1,
+        kind: Kind::Match { subject, arms },
+    })
 }
 
 fn array_items(u: &Unit, start: usize, end: usize, depth: usize) -> Result<Vec<ArrayItem>, String> {

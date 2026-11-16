@@ -3,14 +3,20 @@ use axum::{
     http::{Request, StatusCode},
 };
 use code_atlas::{
-    domain::GraphSnapshot,
+    domain::{
+        Delivery, Diagnostic, Edge, GraphSnapshot, Node, NodeSearch, Result as DomainResult,
+        StoredCorrection,
+    },
     http::{router, HttpConfig},
-    repository::MemoryRepository,
+    repository::{MemoryRepository, Repository},
     service::AtlasService,
 };
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use tower::ServiceExt;
 
 fn config() -> HttpConfig {
@@ -34,6 +40,9 @@ fn config() -> HttpConfig {
         grep_excludes: vec![],
         read_excludes: vec![],
         areas: vec![],
+        log: Default::default(),
+        mcp_hook: Default::default(),
+        omit_resolutions: vec![],
     }
 }
 
@@ -151,6 +160,46 @@ async fn call(app: axum::Router, path: &str, token: &str, body: Value) -> (Statu
             serde_json::from_slice(&bytes).unwrap()
         },
     )
+}
+
+#[tokio::test]
+async fn mcp_instructions_tell_a_client_without_project_docs_when_to_use_atlas() {
+    let app = router(service(), config());
+    let (_, init) = call(app.clone(), "/mcp", "agent-secret", json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}})).await;
+    let instructions = init["result"]["instructions"].as_str().unwrap();
+    for needle in [
+        "PHP",
+        "instead of shell grep",
+        "before",
+        "called_by",
+        "guards",
+        "atlas_read",
+    ] {
+        assert!(instructions.contains(needle), "missing {needle:?}");
+    }
+    let (_, tools) = call(
+        app,
+        "/mcp",
+        "agent-secret",
+        json!({"jsonrpc":"2.0","id":"list","method":"tools/list"}),
+    )
+    .await;
+    let description = |name: &str| {
+        tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .and_then(|t| t["description"].as_str())
+            .unwrap()
+            .to_owned()
+    };
+    for name in ["atlas_search", "atlas_outline", "atlas_grep"] {
+        assert!(
+            description(name).starts_with("USE INSTEAD OF shell grep/rg for PHP"),
+            "{name} description must lead with when to use it"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1150,6 +1199,30 @@ async fn reviewer_search_defaults_to_substring_while_agent_text_needs_whole_iden
 }
 
 #[tokio::test]
+async fn batch_accepts_flat_tool_fields_without_arguments_wrapper() {
+    // report_v3: agents put entity_id next to tool three times in a row.
+    let app = router(lean_service(), config());
+    let reply = tool(
+        app,
+        "atlas_batch",
+        json!({"calls":[
+            {"tool":"atlas_outline","entity_id":"method:pay","sections":["called_by"]},
+            {"tool":"atlas_search","query":"dep_tax_control","kinds":["write_site"]}
+        ]}),
+    )
+    .await;
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let text = mcp_text(&reply);
+    assert!(text.contains("## [1] atlas_outline"), "{text}");
+    assert!(
+        !text.contains("## [1] atlas_outline error:"),
+        "flat entity_id must not fail: {text}"
+    );
+    assert!(text.contains("## [2] atlas_search"), "{text}");
+    assert!(text.contains("# search nodes="), "{text}");
+}
+
+#[tokio::test]
 async fn batch_runs_several_tools_in_one_request_and_isolates_errors() {
     let app = router(lean_service(), config());
     let reply = tool(
@@ -1501,4 +1574,151 @@ async fn area_argument_limits_search_grep_outline_and_callers() {
         message.contains("nope") && message.contains("partner"),
         "{unknown}"
     );
+}
+
+#[tokio::test]
+async fn reviewer_meta_lists_areas_and_plugins() {
+    let mut cfg = config();
+    cfg.areas = vec![code_atlas::domain::Area {
+        prefix: "admin".into(),
+        paths: vec!["admin".into()],
+        shared: false,
+    }];
+    cfg.omit_resolutions = vec!["unresolved".into()];
+    let app = router(service(), cfg);
+    let (status, body) = send(app.clone(), "GET", "/api/meta", "review-secret").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["areas"][0]["id"], "admin");
+    assert_eq!(body["languages"][0], "php");
+    assert_eq!(body["omit_resolutions"][0], "unresolved");
+    let (denied, _) = send(app, "GET", "/api/meta", "agent-secret").await;
+    assert_eq!(denied, StatusCode::UNAUTHORIZED);
+}
+
+/// Repository whose node search panics while armed (a bug inside a tool, not a storage error).
+struct PanickingSearch {
+    inner: MemoryRepository,
+    armed: Arc<AtomicBool>,
+}
+
+macro_rules! forward {
+    ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
+        $(fn $name(&mut self, $($arg: $ty),*) -> $ret { self.inner.$name($($arg),*) })*
+    };
+}
+
+impl Repository for PanickingSearch {
+    forward! {
+        begin() -> DomainResult<()>;
+        commit() -> DomainResult<()>;
+        rollback() -> DomainResult<()>;
+        nodes() -> DomainResult<Vec<Node>>;
+        edges() -> DomainResult<Vec<Edge>>;
+        node(id: &str) -> DomainResult<Option<Node>>;
+        edge(id: &str) -> DomainResult<Option<Edge>>;
+        put_node(node: &Node) -> DomainResult<()>;
+        put_edge(edge: &Edge) -> DomainResult<()>;
+        delete_node(id: &str) -> DomainResult<()>;
+        delete_edge(id: &str) -> DomainResult<()>;
+        corrections() -> DomainResult<Vec<StoredCorrection>>;
+        put_correction(correction: &StoredCorrection) -> DomainResult<()>;
+        diagnostics() -> DomainResult<Vec<Diagnostic>>;
+        set_diagnostics(diagnostics: &[Diagnostic]) -> DomainResult<()>;
+        delivery(id: &str) -> DomainResult<Option<Delivery>>;
+        deliveries(from: i64, to: i64) -> DomainResult<Vec<Delivery>>;
+        put_delivery(delivery: &Delivery) -> DomainResult<()>;
+        meta(key: &str) -> DomainResult<Option<String>>;
+        set_meta(key: &str, value: &str) -> DomainResult<()>;
+        reset() -> DomainResult<()>;
+    }
+    fn search_nodes(&mut self, search: &NodeSearch) -> DomainResult<Vec<Node>> {
+        assert!(
+            !self.armed.load(Ordering::SeqCst),
+            "simulated bug in node search"
+        );
+        self.inner.search_nodes(search)
+    }
+}
+
+fn panicking_service(armed: Arc<AtomicBool>) -> Arc<Mutex<AtlasService>> {
+    let mut service = AtlasService::new(Box::new(PanickingSearch {
+        inner: MemoryRepository::new(),
+        armed,
+    }));
+    let snapshot: GraphSnapshot = serde_json::from_value(json!({"nodes":[
+        {"id":"a", "kind":"method", "name":"pay", "qualified_name":"A::pay", "span":{"path":"a.php","start_line":2,"end_line":4}}
+    ], "edges":[]})).unwrap();
+    service
+        .index(snapshot, vec!["a.php".to_owned()], vec![])
+        .unwrap();
+    Arc::new(Mutex::new(service))
+}
+
+fn search_call(id: u64) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"atlas_search","arguments":{"query":"pay"}}})
+}
+
+#[tokio::test]
+async fn panic_in_a_tool_call_is_an_error_result_and_the_service_keeps_working() {
+    let armed = Arc::new(AtomicBool::new(true));
+    let shared = panicking_service(armed.clone());
+    let app = router(shared.clone(), config());
+    let (_, before) = send(app.clone(), "GET", "/health", "").await;
+    // The counter is process-wide and other tests in this binary panic on purpose.
+    let panics_before = before["panics"].as_u64().expect("health reports panics");
+
+    let (status, failed) = call(app.clone(), "/mcp", "agent-secret", search_call(1)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(failed["result"]["isError"], true, "{failed}");
+    let text = mcp_text(&failed);
+    assert!(text.contains("atlas_search"), "{text}");
+    assert!(!text.contains("simulated bug"), "internals leaked: {text}");
+    assert!(
+        !shared.is_poisoned(),
+        "a caught panic must not poison the service"
+    );
+
+    armed.store(false, Ordering::SeqCst);
+    let (_, healthy) = call(app.clone(), "/mcp", "agent-secret", search_call(2)).await;
+    assert_eq!(healthy["result"]["isError"], false, "{healthy}");
+    assert!(mcp_text(&healthy).contains("pay"));
+
+    let (_, after) = send(app, "GET", "/health", "").await;
+    assert_eq!(after["status"], "ok");
+    assert!(after["panics"].as_u64().unwrap() > panics_before, "{after}");
+}
+
+#[tokio::test]
+async fn panic_in_a_reviewer_route_is_a_storage_error_not_a_lost_service() {
+    let armed = Arc::new(AtomicBool::new(true));
+    let app = router(panicking_service(armed.clone()), config());
+    let (status, body) = send(app.clone(), "GET", "/api/search?q=pay", "review-secret").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    armed.store(false, Ordering::SeqCst);
+    let (status, body) = send(app, "GET", "/api/search?q=pay", "review-secret").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn poisoned_service_lock_is_recovered_for_mcp_and_reviewer_calls() {
+    let shared = service();
+    let poisoner = shared.clone();
+    let _ = std::thread::spawn(move || {
+        let _guard = poisoner.lock().unwrap();
+        panic!("simulated panic while the service lock is held");
+    })
+    .join();
+    assert!(shared.is_poisoned());
+    let app = router(shared, config());
+    let (status, reply) = call(
+        app.clone(),
+        "/mcp",
+        "agent-secret",
+        json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"atlas_context","arguments":{"entity_id":"a"}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    let (status, _) = send(app, "GET", "/api/analytics", "review-secret").await;
+    assert_eq!(status, StatusCode::OK);
 }

@@ -1,19 +1,49 @@
-# Merge services.atlas and volumes.atlas-postgres into the consumer project's Compose.
-# No Atlas checkout, Dockerfile, extends/include or local build is needed.
+# Merge services.atlas-db, services.atlas and volumes.atlas-postgres into the consumer Compose.
+# DB is stock PostgreSQL; only the Atlas app image is published by this project.
 services:
-  atlas:
-    image: ${ATLAS_IMAGE:-drlenux/memory-tools:0.1.0}
+  atlas-db:
+    image: ${ATLAS_DB_IMAGE:-postgres:17-bookworm}
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${ATLAS_POSTGRES_DB:-atlas}
       POSTGRES_USER: ${ATLAS_POSTGRES_USER:-atlas}
       POSTGRES_PASSWORD: ${ATLAS_POSTGRES_PASSWORD:?Set a separate ATLAS_POSTGRES_PASSWORD}
-      PGDATABASE: ${ATLAS_POSTGRES_DB:-atlas}
-      PGUSER: ${ATLAS_POSTGRES_USER:-atlas}
-      PGPASSWORD: ${ATLAS_POSTGRES_PASSWORD:?Set a separate ATLAS_POSTGRES_PASSWORD}
+    volumes:
+      - atlas-postgres:/var/lib/postgresql/data
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${ATLAS_DB_SHARED_BUFFERS:-128MB}
+      - -c
+      - work_mem=${ATLAS_DB_WORK_MEM:-8MB}
+      - -c
+      - maintenance_work_mem=${ATLAS_DB_MAINTENANCE_WORK_MEM:-64MB}
+      - -c
+      - max_wal_size=${ATLAS_DB_MAX_WAL_SIZE:-1GB}
+      - -c
+      - min_wal_size=${ATLAS_DB_MIN_WAL_SIZE:-256MB}
+    mem_limit: ${ATLAS_DB_MEMORY_LIMIT_MB:-1024}m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    stop_grace_period: 30s
+
+  atlas:
+    image: ${ATLAS_IMAGE:-drlenux/memory-tools:0.3.6}
+    restart: unless-stopped
+    depends_on:
+      atlas-db:
+        condition: service_healthy
+    environment:
       ATLAS_PROJECT_ROOT: /project
       ATLAS_BIND: 0.0.0.0:8080
-      ATLAS_DATABASE_URL: ${ATLAS_DATABASE_URL:-host=127.0.0.1 connect_timeout=5}
+      ATLAS_DATABASE_URL: ${ATLAS_DATABASE_URL:-host=atlas-db connect_timeout=5}
+      PGUSER: ${ATLAS_POSTGRES_USER:-atlas}
+      PGDATABASE: ${ATLAS_POSTGRES_DB:-atlas}
+      PGPASSWORD: ${ATLAS_POSTGRES_PASSWORD:?Set a separate ATLAS_POSTGRES_PASSWORD}
       ATLAS_AGENT_TOKEN: ${ATLAS_AGENT_TOKEN:?Set ATLAS_AGENT_TOKEN}
       ATLAS_REVIEW_TOKEN: ${ATLAS_REVIEW_TOKEN:?Set a different ATLAS_REVIEW_TOKEN}
       ATLAS_ALLOWED_ORIGINS: '${ATLAS_ALLOWED_ORIGINS:-["http://localhost:${ATLAS_HOST_PORT:-8080}","http://127.0.0.1:${ATLAS_HOST_PORT:-8080}"]}'
@@ -21,13 +51,18 @@ services:
       ATLAS_INDEX_WORKERS: ${ATLAS_INDEX_WORKERS:-0}
       ATLAS_MEMORY_LIMIT_MB: ${ATLAS_MEMORY_LIMIT_MB:-1024}
     volumes:
-      - atlas-postgres:/var/lib/postgresql/data
       - type: bind
         source: ${ATLAS_HOST_PROJECT_ROOT:-.}
         target: /project
         read_only: true
         bind:
           create_host_path: false
+      - type: bind
+        source: ${ATLAS_HOST_PROJECT_ROOT:-.}/.atlas
+        target: /project/.atlas
+        read_only: false
+        bind:
+          create_host_path: true
     ports:
       - "127.0.0.1:${ATLAS_HOST_PORT:-8080}:8080"
     cpus: ${ATLAS_CPU_LIMIT:-1}

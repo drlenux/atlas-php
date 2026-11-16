@@ -81,6 +81,14 @@ fn analyze_files(
     for (_, result) in parsed {
         match result.expect("successful worker filled its result slot") {
             Ok((unit, mut declarations)) => {
+                if options.declaration_only(&unit.file.path) {
+                    options.log.parse_skip(
+                        &unit.file.path,
+                        0,
+                        "declaration_only",
+                        "function bodies skipped: path is under index.declaration_paths",
+                    );
+                }
                 let unit_index = project.units.len();
                 for class in declarations.classes.values_mut() {
                     class.unit = unit_index;
@@ -159,60 +167,78 @@ fn analyze_files(
         .set_workers(workers.min(functions.len().max(1)));
     let base_nodes = std::mem::take(&mut project.nodes);
     let base_edges = std::mem::take(&mut project.edges);
-    // Pass 1: collect body returns. Pass 2: callers see inferred_return of callees.
-    let pass1 = run_flow_pass(
-        &functions,
-        &base_nodes,
-        base_edges.len(),
-        &project,
-        options,
-        workers,
-    )?;
-    for (position, outcome) in pass1.into_iter().enumerate() {
-        let function = &functions[position];
-        if let Ok((nodes, _, _)) = outcome {
-            if let Some(inferred) = inferred_return(function, nodes.get(&function.id)) {
-                if let Some(f) = project.functions.get_mut(&function.id) {
-                    f.inferred_return = Some(inferred);
+    let relation_edge_count = base_edges.len();
+    // Pass 1: collect body returns in batches. Drop each batch before the next so
+    // peak RSS is not ~N function graphs at once (2 GiB containers OOM on Slotor).
+    for chunk in functions.chunks(FLOW_BATCH) {
+        let pass1 = run_flow_pass(
+            chunk,
+            &base_nodes,
+            relation_edge_count,
+            &project,
+            options,
+            workers,
+        )?;
+        for (offset, outcome) in pass1.into_iter().enumerate() {
+            let function = &chunk[offset];
+            if let Ok((nodes, _, _)) = outcome {
+                if let Some(inferred) = inferred_return(function, nodes.get(&function.id)) {
+                    if let Some(f) = project.functions.get_mut(&function.id) {
+                        f.inferred_return = Some(inferred);
+                    }
                 }
             }
         }
     }
-    let pass2 = run_flow_pass(
-        &functions,
-        &base_nodes,
-        base_edges.len(),
-        &project,
-        options,
-        workers,
-    )?;
-    project.nodes = base_nodes;
-    project.edges = base_edges;
-    for (position, outcome) in pass2.into_iter().enumerate() {
-        let function = &functions[position];
-        match outcome {
-            Ok((nodes, edges, diagnostics)) => {
-                project.nodes.extend(nodes);
-                project.edges.extend(edges);
-                project.diagnostics.extend(diagnostics);
-            }
-            Err(error) => {
-                // Keep file declarations: one bad method body must not drop the class.
-                let path = project.units[function.unit].file.path.clone();
-                project.diagnostics.push(Diagnostic {
-                    path,
-                    line: project.units[function.unit]
-                        .span(function.start, function.end)
-                        .start_line,
-                    code: "analysis_limitation".into(),
-                    message: error,
-                });
+    // Pass 2: merge occurrence graphs batch-by-batch; base stays declaration-only.
+    let mut occurrence_nodes = BTreeMap::new();
+    let mut occurrence_edges = BTreeMap::new();
+    for chunk in functions.chunks(FLOW_BATCH) {
+        let pass2 = run_flow_pass(
+            chunk,
+            &base_nodes,
+            relation_edge_count,
+            &project,
+            options,
+            workers,
+        )?;
+        for (offset, outcome) in pass2.into_iter().enumerate() {
+            let function = &chunk[offset];
+            match outcome {
+                Ok((nodes, edges, diagnostics)) => {
+                    occurrence_nodes.extend(nodes);
+                    occurrence_edges.extend(edges);
+                    project.diagnostics.extend(diagnostics);
+                }
+                Err(error) => {
+                    // Keep file declarations: one bad method body must not drop the class.
+                    let path = project.units[function.unit].file.path.clone();
+                    project.diagnostics.push(Diagnostic {
+                        path,
+                        line: project.units[function.unit]
+                            .span(function.start, function.end)
+                            .start_line,
+                        code: "analysis_limitation".into(),
+                        message: error,
+                    });
+                }
             }
         }
     }
+    drop(functions);
+    project.nodes = base_nodes;
+    project.edges = base_edges;
+    project.nodes.extend(occurrence_nodes);
+    project.edges.extend(occurrence_edges);
     options
         .progress
         .phase("analysis", "php_finalize", None, "items");
+    // Parse corpus is unused for origins; free it before definition materialization.
+    project.units = Vec::new();
+    project.classes = BTreeMap::new();
+    project.functions = BTreeMap::new();
+    project.closures = BTreeMap::new();
+    project.index = ClassIndex::default();
     project.origins();
     options.check(project.nodes.len() + project.edges.len())?;
     let mut graph = GraphSnapshot {
@@ -223,6 +249,9 @@ fn analyze_files(
     crate::analyzer::sync_occurrence_resolution(&mut graph);
     Ok(graph)
 }
+
+/// Max concurrent function-body graphs held during a flow pass.
+const FLOW_BATCH: usize = 512;
 type FlowDelta = (
     BTreeMap<String, Node>,
     BTreeMap<String, Edge>,
@@ -562,7 +591,7 @@ impl<'a> Project<'a> {
         for f in self.functions.values() {
             self.options.check(self.nodes.len() + self.edges.len())?;
             let u = &self.units[f.unit];
-            self.nodes.insert(f.id.clone(),Node{id:f.id.clone(),kind:if f.id.starts_with("method:"){"method"}else{"function"}.into(),name:f.name.clone(),qualified_name:f.qualified.clone(),span:u.span(f.start,f.end),metadata:json!({"fingerprint":u.fp(f.start,f.end,f.name_token),"returns":[],"implicit_return":false,"closure":f.closure,"declared_return_type":f.return_type,"parameters":f.parameters.iter().map(|p|json!({"name":p.name,"type":p.type_name,"type_source":type_source(p.annotated)})).collect::<Vec<_>>(),"annotated_return_type":f.doc_return,"namespace":f.names.namespace,"imports":f.names.imports,"commented":false}),trust:1,revision:0});
+            self.nodes.insert(f.id.clone(),Node{id:f.id.clone(),kind:if f.id.starts_with("method:"){"method"}else{"function"}.into(),name:f.name.clone(),qualified_name:f.qualified.clone(),span:u.span(f.start,f.end),metadata:json!({"fingerprint":u.fp(f.start,f.end,f.name_token),"returns":[],"implicit_return":false,"closure":f.closure,"declared_return_type":f.return_type,"parameters":f.parameters.iter().map(parameter_metadata).collect::<Vec<_>>(),"annotated_return_type":f.doc_return,"namespace":f.names.namespace,"imports":f.names.imports,"commented":false}),trust:1,revision:0});
             if f.magic {
                 let node = self.nodes.get_mut(&f.id).expect("inserted above");
                 node.metadata["magic"] = json!(true);
@@ -1090,16 +1119,45 @@ impl<'a> Project<'a> {
         });
     }
     fn origins(&mut self) {
-        let nodes = self.nodes.clone();
+        // Only materialize definitions that returns actually reference. Keep the
+        // payload to id+span: embedding every target's returns/snippets into each
+        // origin cloned the occurrence graph again and OOM'd php_finalize at 2 GiB.
+        let mut needed: BTreeSet<String> = BTreeSet::new();
+        for n in self.nodes.values() {
+            if let Some(returns) = n.metadata["returns"].as_array() {
+                for r in returns {
+                    if let Some(origins) = r["origins"].as_array() {
+                        for origin in origins {
+                            if let Some(id) = origin["symbol_id"].as_str() {
+                                needed.insert(id.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let defs: BTreeMap<String, Value> = needed
+            .into_iter()
+            .filter_map(|id| {
+                let target = self.nodes.get(&id)?;
+                Some((
+                    id,
+                    json!({
+                        "id": target.id,
+                        "span": target.span,
+                    }),
+                ))
+            })
+            .collect();
         for n in self.nodes.values_mut() {
             if let Some(returns) = n.metadata["returns"].as_array_mut() {
                 for r in returns {
                     if let Some(origins) = r["origins"].as_array_mut() {
                         for origin in origins {
-                            if let Some(target) =
-                                origin["symbol_id"].as_str().and_then(|id| nodes.get(id))
+                            if let Some(def) =
+                                origin["symbol_id"].as_str().and_then(|id| defs.get(id))
                             {
-                                origin["definition"] = json!({"id":target.id,"span":target.span,"returns":target.metadata["returns"].as_array().map(|rs|rs.iter().map(|r|json!({"line":r["line"],"expression":r["expression"],"type":r["type"],"snippet":r["snippet"]})).collect::<Vec<_>>()).unwrap_or_default()});
+                                origin["definition"] = def.clone();
                             }
                         }
                     }
@@ -1125,6 +1183,17 @@ pub(super) fn type_source(annotated: bool) -> &'static str {
     } else {
         "code"
     }
+}
+
+/// Parameter entry of a function node; `variadic` is written only when true so existing
+/// metadata (and the incremental declaration surface) stays unchanged for the rest.
+fn parameter_metadata(p: &syntax::Parameter) -> Value {
+    let mut meta =
+        json!({"name": p.name, "type": p.type_name, "type_source": type_source(p.annotated)});
+    if p.variadic {
+        meta["variadic"] = json!(true);
+    }
+    meta
 }
 
 fn property_node(id: &str, class: &Class, property: &syntax::Property, u: &Unit) -> Node {

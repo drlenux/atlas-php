@@ -1,6 +1,8 @@
 //! Stderr lines for indexing diagnostics so `docker logs` shows what the
 //! analyzer could not interpret (parse gaps), without dumping every unresolved call.
-use crate::domain::Diagnostic;
+//! When `.atlas/setup.yaml` enables `logging.parse_errors` / `parse_skips`, the same
+//! (and skip) lines also go to the project log file without the stderr cap.
+use crate::{domain::Diagnostic, logging::AtlasLog};
 use std::collections::BTreeMap;
 
 /// Codes that mean the file/body was not fully understood — useful in support logs.
@@ -55,11 +57,12 @@ pub fn format_diagnostic_log(diagnostics: &[Diagnostic], max_lines: usize) -> Ve
     lines
 }
 
-/// Write structural/interpretation diagnostics to stderr for operators and support.
-pub fn log_diagnostics(diagnostics: &[Diagnostic]) {
+/// Write structural/interpretation diagnostics to stderr and optional project file.
+pub fn log_diagnostics(diagnostics: &[Diagnostic], file_log: &AtlasLog) {
     for line in format_diagnostic_log(diagnostics, DEFAULT_MAX_LINES) {
         eprintln!("{line}");
     }
+    file_log.diagnostics(diagnostics);
 }
 
 #[cfg(test)]

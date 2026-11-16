@@ -1,0 +1,51 @@
+{
+  "mode": "grep",
+  "run": 3,
+  "exit": 0,
+  "elapsed_s": 499.6,
+  "cost_usd": 2.4375672000000006,
+  "usage": {
+    "input_tokens": 70,
+    "cache_creation_input_tokens": 112304,
+    "cache_read_input_tokens": 3078876,
+    "output_tokens": 46154,
+    "output_tokens_details": {
+      "thinking_tokens": 31470
+    },
+    "server_tool_use": {
+      "web_search_requests": 0,
+      "web_fetch_requests": 0
+    },
+    "service_tier": "standard",
+    "cache_creation": {
+      "ephemeral_1h_input_tokens": 112304,
+      "ephemeral_5m_input_tokens": 0
+    },
+    "inference_geo": "global",
+    "iterations": [
+      {
+        "input_tokens": 2,
+        "output_tokens": 14921,
+        "cache_read_input_tokens": 139972,
+        "cache_creation_input_tokens": 1140,
+        "cache_creation": {
+          "ephemeral_5m_input_tokens": 0,
+          "ephemeral_1h_input_tokens": 1140
+        },
+        "type": "message"
+      }
+    ],
+    "speed": "standard",
+    "fallback_credit": null
+  },
+  "tool_calls": 52,
+  "atlas_calls": 0,
+  "atlas_share": 0.0,
+  "must_find": {
+    "api_bonus_type": true,
+    "bgp_is_ended": true,
+    "create_freespin_bind_loop": true
+  },
+  "answer_head": "# Расследование MaxWin для фриспинов\n\nКод не менял, файлы не создавал. Использовал только Grep/Glob/Read/Bash, MCP не трогал.\n\n## 1. Как устроена логика MaxWin\n\n**Настройка и создание лимита**\n- Лимит бонуса хранится в `MaxWinSettingBonus.value`. Его читают `Bonus::getMaxWin()` (`common/models/Bonus.php:727`) и `BonusCod::getMaxWin()` (`common/models/BonusCod.php:289`).\n- При вставке UserBonus `afterSave` (`common/models/UserBonus.php:1206`) вызывает `setMaxWin` (`UserBonus.php:96`), а тот вызыв",
+  "stream": "grep_3.jsonl"
+}

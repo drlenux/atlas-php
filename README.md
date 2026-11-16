@@ -2,7 +2,7 @@
 
 Code Atlas строит карту PHP/Yii2-проекта: какие классы и методы существуют, кто кого вызывает, откуда читаются данные, куда они записываются и при каких условиях выполняются операции. Агент получает эту информацию через MCP, разработчик просматривает граф, проверяет исправления и смотрит аналитику в браузере.
 
-Анализаторы написаны на Rust и встроены в приложение. Исходники исследуемого проекта читаются как текст: PHP CLI, Composer, автозагрузчик и запуск приложения для анализа не нужны. В поставляемом контейнере работают Atlas и PostgreSQL с расширением pgvector. Векторный поиск в текущем коде не используется.
+Анализаторы написаны на Rust и встроены в приложение. Исходники исследуемого проекта читаются как текст: PHP CLI, Composer, автозагрузчик и запуск приложения для анализа не нужны. Поставка — образ MCP/приложения (`ATLAS_IMAGE`) и отдельный сервис на официальном PostgreSQL (`ATLAS_DB_IMAGE`, по умолчанию `postgres:17-bookworm`). pgvector не нужен.
 
 Подробное объяснение всего пути — от чтения файлов до ответа агенту — находится в [How works.md](How%20works.md).
 
@@ -10,7 +10,7 @@ Code Atlas строит карту PHP/Yii2-проекта: какие клас�
 
 - Строит граф объявлений, наследования, вызовов, чтений, записей, переменных, параметров и ветвлений; сохраняет позиции и условия выполнения.
 - Выводит типы из PHP-кода, PHPDoc, возвратов функций и статически понятных механизмов Yii2. Различает установленную цель, аннотацию, кандидатов и неизвестную цель.
-- Извлекает raw SQL из `createCommand` / `findBySql` / `prepare` в PHP (`sql_site`, таблицы, `sql_reads`/`sql_writes`); при `languages: […, pgsql]` индексирует `.sql`/`.pgsql` (DDL schema/table/column/view/function/index).
+- Извлекает raw SQL из `createCommand` / `findBySql` / `prepare` в PHP (`sql_site`, таблицы/колонки, `sql_reads`/`sql_writes`); AR `tableName()` → `maps_table`; при `languages: […, pgsql]` индексирует `.sql`/`.pgsql` (DDL schema/table/column/view/function/index).
 - Дополняет PHP-граф сведениями о компонентах Yii2, behaviors, magic properties, ActiveRecord/ActiveQuery, конфигурационных ключах, представлениях, URL, очередях и событиях — в пределах поддержанного статического разбора.
 - Предоставляет семь MCP-инструментов: поиск сущностей, контекст, структуру класса/метода, текстовый поиск, чтение строк, исправление знаний и пакет запросов.
 - Следит за изменениями файлов, выполняет инкрементальные обновления и показывает состояние индексации. Полный проход доступен вручную.
@@ -24,24 +24,26 @@ Code Atlas строит карту PHP/Yii2-проекта: какие клас�
 Нужны Docker с Compose, доступный образ Atlas и каталог исследуемого проекта. Сборка образа описана ниже; наличие примера тега в репозитории не подтверждает его публикацию в реестре.
 
 1. Добавьте сервис и volume из [examples/compose.atlas.yml](examples/compose.atlas.yml) в Compose исследуемого проекта. Для отдельного запуска можно использовать [docker-compose.yml](docker-compose.yml) этого репозитория, указав `ATLAS_HOST_PROJECT_ROOT`.
-2. Возьмите [.env.example](.env.example) за основу. Задайте `ATLAS_IMAGE` доступным тегом или digest, заполните `ATLAS_POSTGRES_PASSWORD` и два **разных** токена: `ATLAS_AGENT_TOKEN` и `ATLAS_REVIEW_TOKEN`. Для каждого секрета можно отдельно выполнить `openssl rand -hex 32`.
+2. Возьмите [.env.example](.env.example) за основу. Задайте `ATLAS_IMAGE` (опционально `ATLAS_DB_IMAGE=postgres:17-bookworm`), заполните `ATLAS_POSTGRES_PASSWORD` и два **разных** токена: `ATLAS_AGENT_TOKEN` и `ATLAS_REVIEW_TOKEN`. Для каждого секрета можно отдельно выполнить `openssl rand -hex 32`.
 3. Создайте в исследуемом проекте `.atlas/setup.yaml` по [examples/setup.yaml](examples/setup.yaml). Проверьте каталоги, исключения, версию PHP и список приложений `areas` под свой проект. В шаблоне есть примерные исключения и приложения; их следует адаптировать.
-4. Запустите сервис из каталога его Compose-файла:
+4. Запустите сервисы из каталога Compose-файла:
 
 ```sh
 docker compose config --quiet
-docker compose pull atlas
-docker compose up -d --no-build atlas
+docker compose pull atlas-db atlas
+docker compose up -d --no-build atlas-db atlas
 docker compose logs -f atlas
 ```
 
 По умолчанию веб доступен на `http://localhost:8080`, MCP — на `http://localhost:8080/mcp`. При другом `ATLAS_HOST_PORT` используйте соответствующий порт. На веб-странице введите reviewer-токен; он хранится в памяти открытой страницы. HTTP MCP принимает `Authorization: Bearer <ATLAS_AGENT_TOKEN>`.
 
+Чтобы агент «без указаний» реально вызывал Atlas (soft-хук, skill, `instructions`): [examples/README.md](examples/README.md), установка — `examples/install-agent-hints.sh /path/to/project`.
+
 Для агента: шаблон MCP-сервера — [examples/mcp.json.example](examples/mcp.json.example); skill навигации — [examples/skills/atlas-navigation/](examples/skills/atlas-navigation/) (`SKILL.md` + `reference.md`; скопируйте каталог в `.claude/skills/atlas-navigation/` исследуемого проекта).
 
 Первичная индексация запускается автоматически. Доступность HTTP и успешный healthcheck ещё не означают готовность графа: дождитесь завершения публикации в панели или сообщения `100% committed` в логах.
 
-Проект монтируется в `/project` только для чтения. Данные PostgreSQL сохраняются в named volume `atlas-postgres`. Compose публикует порт Atlas на `127.0.0.1`, PostgreSQL слушает внутри контейнера. Пользователь процесса Atlas должен иметь права читать примонтированные файлы.
+Проект монтируется в `/project` только для чтения. Данные PostgreSQL — в named volume `atlas-postgres` у сервиса `atlas-db`. Compose публикует порт Atlas на `127.0.0.1`; БД в сети Compose не публикуется наружу. Лимиты памяти у app и DB задаются отдельно (`ATLAS_MEMORY_LIMIT_MB`, `ATLAS_DB_MEMORY_LIMIT_MB`).
 
 ## Настройки проекта
 
@@ -72,7 +74,7 @@ index:
 | `index.max_file_bytes` | `2097152`: до 2 MiB на файл анализа. |
 | `index.max_analysis_bytes` | `67108864`: до 64 MiB суммарного текста за проход. |
 | `index.max_graph_elements` | `2000000`: вершины, рёбра и диагностики. |
-| `index.analysis_timeout_secs` | `120`: ограничение времени анализа, проверяемое внутри конвейера. |
+| `index.analysis_timeout_secs` | `900`: лимит времени одного прохода анализа (на 1 CPU крупные Yii-проекты ~10 мин). |
 | `index.debounce_ms`, `index.poll_ms` | `5000`, `1000`: ожидание после последней правки и период сканирования. |
 | `grep.exclude`, `grep.max_file_bytes` | Исключения только текстового поиска; лимит файла `16777216` (16 MiB). |
 | `tests.paths` | `["tests/*", "*/tests/*", "*Test.php", "*Cest.php"]`: тесты скрыты от агентского поиска и списка вызывающих без `include_tests: true`. |
@@ -99,13 +101,14 @@ areas:
 
 | Переменная | Назначение |
 | --- | --- |
-| `ATLAS_IMAGE` | Образ для Compose. Сейчас Compose без ENV выбирает `drlenux/memory-tools:0.1.0`, а `.env.example` содержит `0.1.25`. Укажите нужный доступный тег или digest явно. |
-| `ATLAS_POSTGRES_DB`, `ATLAS_POSTGRES_USER`, `ATLAS_POSTGRES_PASSWORD` | Настройки встроенной БД в Compose: `atlas`, `atlas`, обязательный пароль. Передаются также как `POSTGRES_*` и `PG*`. |
+| `ATLAS_IMAGE` | Образ MCP/приложения. Compose без ENV выбирает `drlenux/memory-tools:0.3.6`. |
+| `ATLAS_DB_IMAGE` | Официальный PostgreSQL. Compose без ENV выбирает `postgres:17-bookworm`. |
+| `ATLAS_POSTGRES_DB`, `ATLAS_POSTGRES_USER`, `ATLAS_POSTGRES_PASSWORD` | Настройки БД в Compose: `atlas`, `atlas`, обязательный пароль. Передаются также как `POSTGRES_*` и `PG*`. |
 | `ATLAS_HOST_PROJECT_ROOT`, `ATLAS_HOST_PORT` | Настройки Compose: каталог хоста (`.`) и порт (`8080`). |
-| `ATLAS_DATABASE_URL` | Обязательное подключение приложения к PostgreSQL: URI или libpq conninfo. В Compose по умолчанию `host=127.0.0.1 connect_timeout=5`, остальные параметры берутся из `PG*`. |
+| `ATLAS_DATABASE_URL` | Подключение приложения к `atlas-db`: URI или libpq conninfo. В Compose по умолчанию `host=atlas-db connect_timeout=5`; `PGUSER`/`PGPASSWORD`/`PGDATABASE` задаются рядом. |
 | `ATLAS_PROJECT_ROOT`, `ATLAS_BIND` | Корень внутри процесса и адрес HTTP. Compose задаёт `/project` и `0.0.0.0:8080`; локальный bind по умолчанию `127.0.0.1:8080`. |
 | `ATLAS_AGENT_TOKEN`, `ATLAS_REVIEW_TOKEN` | Обязательные непустые разные токены MCP и reviewer API. |
-| `ATLAS_CPU_LIMIT`, `ATLAS_MEMORY_LIMIT_MB` | `1` CPU и `1024` MiB по умолчанию. Compose ограничивает весь контейнер, включая PostgreSQL. Сами ENV вне Compose не создают системных ограничений. |
+| `ATLAS_CPU_LIMIT`, `ATLAS_MEMORY_LIMIT_MB` | `1` CPU и `1024` MiB по умолчанию для сервиса `atlas`. `ATLAS_DB_MEMORY_LIMIT_MB` — отдельно для Postgres. |
 | `ATLAS_INDEX_WORKERS` | `0`: автоматически `ceil(ATLAS_CPU_LIMIT)` в пределах 1..32; 1..32 — явное число рабочих потоков. |
 | `ATLAS_ALLOWED_ORIGINS` | JSON-массив разрешённых HTTP(S) origins. Compose подставляет localhost и 127.0.0.1 с внешним портом; для reverse proxy задайте реальные origins. |
 

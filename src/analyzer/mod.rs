@@ -27,6 +27,8 @@ pub struct AnalysisOptions {
     pub incremental: Option<std::sync::Arc<Incremental>>,
     /// Application folders (`.atlas/setup.yaml` `areas`).
     pub areas: Vec<crate::domain::Area>,
+    /// Optional project file log (parse errors/skips).
+    pub log: crate::logging::AtlasLog,
 }
 
 /// Context of an incremental rebuild. A language plugin that supports it analyzes
@@ -84,12 +86,13 @@ impl Default for AnalysisOptions {
         Self {
             language_versions: BTreeMap::new(),
             max_graph_elements: 2_000_000,
-            deadline: Instant::now() + Duration::from_secs(120),
+            deadline: Instant::now() + Duration::from_secs(900),
             workers: 1,
             progress: Default::default(),
             declaration_paths: Vec::new(),
             incremental: None,
             areas: Vec::new(),
+            log: crate::logging::AtlasLog::default(),
         }
     }
 }

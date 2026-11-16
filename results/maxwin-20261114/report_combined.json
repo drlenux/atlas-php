@@ -1,0 +1,41 @@
+{
+  "freeze": {
+    "slotor_commit": "67e57a4376258503c0651ede23e296de33d7aa3f",
+    "atlas_health": "{\"panics\":0,\"service\":\"code-atlas\",\"status\":\"ok\"}",
+    "gold": "/Users/eselbelokudrenko/Projects/memory/bench/gold/maxwin.yaml",
+    "model": "opus",
+    "n": 5
+  },
+  "atlas": {
+    "facts": {
+      "api_bonus_type": "5/5",
+      "bgp_is_ended": "5/5",
+      "create_freespin_bind_loop": "5/5"
+    },
+    "cost_median": 2.0,
+    "cost_sum": 10.05,
+    "time_median_s": 392.0,
+    "atlas_share_min": 0.867
+  },
+  "grep": {
+    "facts": {
+      "api_bonus_type": "5/5",
+      "bgp_is_ended": "5/5",
+      "create_freespin_bind_loop": "5/5"
+    },
+    "cost_median": 2.44,
+    "cost_sum": 12.35,
+    "time_median_s": 470.2,
+    "atlas_share_min": 0.0
+  },
+  "gate": {
+    "api_bonus_type_atlas_ge_4_of_5": true,
+    "bgp_atlas_ge_4_of_5": true,
+    "atlas_api_recall_ge_grep": true,
+    "atlas_share_min_ge_70": true
+  },
+  "baseline_pre_fix": {
+    "atlas_api_bonus_type": "0/2",
+    "note": "report_3 + report_3_v2"
+  }
+}

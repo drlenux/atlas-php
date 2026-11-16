@@ -3,7 +3,7 @@ import { createIndexingPoller } from './indexing.mjs';
 import { SEARCH_GROUPS, entityLabel, contextView, isOccurrence } from './explore.mjs';
 
 const $ = (id) => document.getElementById(id);
-const state = { token: '', analytics: null, offset: 0, limit: 20, generation: 0, visible: 100, search: null, history: [] };
+const state = { token: '', analytics: null, offset: 0, limit: 20, generation: 0, visible: 100, search: null, history: [], meta: null };
 const number = new Intl.NumberFormat('ru-RU');
 const date = new Intl.DateTimeFormat('ru-RU', { day: 'numeric', month: 'short', timeZone: 'UTC' });
 
@@ -37,8 +37,27 @@ async function api(path, options = {}) {
 }
 
 function connection(ready) {
+  document.body.classList.toggle('is-connected', ready);
   $('connection').classList.toggle('ready', ready);
   $('connection').replaceChildren(element('span'), document.createTextNode(ready ? 'Подключено к атласу' : 'Ожидание подключения'));
+}
+
+function fillAreas(meta) {
+  const select = $('search-area');
+  const current = select.value;
+  select.replaceChildren(element('option', 'Все области'));
+  select.firstChild.value = '';
+  for (const area of meta?.areas || []) {
+    const option = element('option', area.shared ? `${area.id} (shared)` : area.id);
+    option.value = area.id;
+    select.append(option);
+  }
+  if ([...select.options].some(option => option.value === current)) select.value = current;
+}
+
+async function loadMeta() {
+  state.meta = await api('/api/meta');
+  fillAreas(state.meta);
 }
 
 let lastIndexing;
@@ -216,7 +235,7 @@ $('connect-form').addEventListener('submit', event => {
   indexingPoller.start();
   guarded(async () => {
     connection(false);
-    await Promise.all([loadAnalytics(), loadReviews()]);
+    await Promise.all([loadMeta(), loadAnalytics(), loadReviews()]);
     connection(true);
     $('token').value = '';
     $('token').placeholder = 'Подключение установлено';
@@ -302,37 +321,93 @@ function searchResult(node) {
   return button;
 }
 
-async function loadSearchPage() {
+function renderGrep(page, append) {
+  const panel = $('grep-panel');
+  const hits = page.grep?.hits || [];
+  if (!append) $('grep-results').replaceChildren();
+  if (!page.grep && !state.search?.grep) {
+    panel.hidden = true;
+    return;
+  }
+  panel.hidden = false;
+  for (const hit of hits) {
+    const row = element('button', undefined, `grep-hit${hit.commented ? ' commented' : ''}`);
+    row.type = 'button';
+    row.title = `${hit.path}:${hit.line}`;
+    row.append(element('span', `${hit.path}:${hit.line}`, 'grep-loc'));
+    row.append(element('code', hit.text));
+    $('grep-results').append(row);
+  }
+  const total = $('grep-results').childElementCount;
+  const incomplete = page.grep?.incomplete ? ', неполный обход' : '';
+  $('grep-summary').textContent = total
+    ? `Показано ${number.format(total)} текстовых совпадений${page.grep_next_cursor || page.grep?.next_cursor ? ', есть ещё' : ''}${incomplete}`
+    : (state.search?.grep ? 'Дополнительных текстовых совпадений нет.' : '');
+  $('grep-more').hidden = !(page.grep_next_cursor || page.grep?.next_cursor);
+  state.search.grepCursor = page.grep_next_cursor || page.grep?.next_cursor || null;
+}
+
+async function loadSearchPage({ grepOnly = false } = {}) {
   const search = state.search;
   const params = new URLSearchParams({ q: search.query, limit: '50' });
   if (search.kinds.length) params.set('kinds', search.kinds.join(','));
-  if (search.cursor) params.set('cursor', search.cursor);
+  if (search.area) params.set('area', search.area);
+  if (!grepOnly && search.cursor) params.set('cursor', search.cursor);
   if (search.symbol) params.set('mode', 'symbol');
+  if (search.grep) {
+    params.set('withGrep', 'true');
+    if (search.grepCursor) params.set('grepCursor', search.grepCursor);
+  }
   const page = await api(`/api/search?${params}`);
   if (search !== state.search) return;
-  search.count += page.nodes.length;
-  search.cursor = page.next_cursor;
-  if (page.nodes.length) {
-    $('search-results').append(...page.nodes.map(searchResult));
-  } else if (!search.count) {
-    $('search-results').replaceChildren(element('p', 'По вашему запросу сущности не найдены.', 'empty'));
+  if (!grepOnly) {
+    search.count += page.nodes?.length || 0;
+    search.cursor = page.next_cursor;
+    if (page.nodes?.length) {
+      $('search-results').append(...page.nodes.map(searchResult));
+    } else if (!search.count) {
+      $('search-results').replaceChildren(element('p', 'По вашему запросу сущности не найдены.', 'empty'));
+    }
+    $('search-summary').textContent = search.count ? `Показано ${number.format(search.count)}${search.cursor ? ', есть ещё' : ''}` : '';
+    $('search-more').hidden = !search.cursor;
   }
-  $('search-summary').textContent = search.count ? `Показано ${number.format(search.count)}${search.cursor ? ', есть ещё' : ''}` : '';
-  $('search-more').hidden = !search.cursor;
+  if (search.grep) renderGrep(page, grepOnly);
+  else {
+    $('grep-panel').hidden = true;
+    search.grepCursor = null;
+  }
 }
 
 $('search-form').addEventListener('submit', event => {
   event.preventDefault();
   const group = SEARCH_GROUPS.find(g => g.id === $('search-kind').value) || SEARCH_GROUPS[0];
-  state.search = { query: $('search-query').value, kinds: group.kinds, cursor: null, count: 0, symbol: $('search-symbol').checked };
+  state.search = {
+    query: $('search-query').value,
+    kinds: group.kinds,
+    cursor: null,
+    count: 0,
+    symbol: $('search-symbol').checked,
+    grep: $('search-grep').checked,
+    grepCursor: null,
+    area: $('search-area').value || '',
+  };
   $('search-results').replaceChildren();
+  $('grep-results').replaceChildren();
   $('search-summary').textContent = 'Поиск…';
+  $('grep-summary').textContent = '';
   $('search-more').hidden = true;
+  $('grep-more').hidden = true;
+  $('grep-panel').hidden = !state.search.grep;
   guarded(loadSearchPage);
 });
 $('search-more').addEventListener('click', () => guarded(async () => {
   $('search-more').disabled = true;
   try { await loadSearchPage(); } finally { $('search-more').disabled = false; }
+}));
+$('grep-more').addEventListener('click', () => guarded(async () => {
+  if (!state.search?.grepCursor) return;
+  $('grep-more').disabled = true;
+  try { await loadSearchPage({ grepOnly: true }); } finally { $('grep-more').disabled = false; }
 }));
 
 function effectItem(item, { showOwner = false, showTarget = false } = {}) {
@@ -346,12 +421,18 @@ function effectItem(item, { showOwner = false, showTarget = false } = {}) {
     head.append(element('span', 'в', 'arrow'), entityLink(item.owner));
   }
   if (item.resolution === 'unresolved' || item.resolution === 'ambiguous') head.append(element('span', item.resolution === 'ambiguous' ? 'неоднозначно' : 'не распознано', 'unresolved'));
+  if (item.resolution === 'undeclared') {
+    const badge = element('span', 'нет члена', 'unresolved');
+    badge.title = 'Тип получателя известен, но член не найден — вероятная ошибка времени выполнения.';
+    head.append(badge);
+  }
   if (item.resolution === 'annotated') {
     const badge = element('span', 'по аннотации', 'annotated');
     badge.title = 'Цель найдена через тип из PHPDoc (@var, @param, @return, @property). Аннотация может быть неверной.';
     head.append(badge);
   }
   if (item.resolution === 'candidate') head.append(element('span', 'несколько реализаций', 'annotated'));
+  if (item.resolution === 'external') head.append(element('span', 'вне индекса', 'annotated'));
   if (item.queue) head.append(element('span', `очередь ${item.queue}`, 'type-pill'));
   row.append(head);
   const where = element('small', item.site?.location || '');
@@ -405,9 +486,17 @@ function renderContext(context) {
     section('Вызывает', view.effects.calls, item => effectItem(item, { showTarget: true })),
     section('Пишет', view.effects.writes, item => effectItem(item, { showTarget: true })),
     section('Читает', view.effects.reads, item => effectItem(item, { showTarget: true })),
+    section('SQL читает', view.effects.sql_reads, item => effectItem(item, { showTarget: true })),
+    section('SQL пишет', view.effects.sql_writes, item => effectItem(item, { showTarget: true })),
     section('Ставит в очередь', view.effects.dispatches, item => effectItem(item, { showTarget: true })),
     section('Возвращает', view.effects.returns, item => effectItem(item)),
     section('Ветки', view.branches, ref => { const li = element('li', undefined, 'effect'); li.append(entityLink(ref, 'entity-link code'), element('small', ref.location)); return li; }),
+    section('SQL к этой таблице', [...view.incoming.sql_reads, ...view.incoming.sql_writes], item => effectItem(item, { showOwner: true })),
+    section('Связи типа', view.relations || [], item => {
+      const li = element('li', undefined, 'effect');
+      li.append(element('span', `${item.outgoing ? '→' : '←'} ${item.kind} `, 'arrow'), entityLink(item.node));
+      return li;
+    }),
     section('Прочие связи', view.other, item => { const li = element('li', undefined, 'effect'); li.append(element('span', `${item.outgoing ? '→' : '←'} ${item.kind} `, 'arrow'), entityLink(item.node)); return li; }),
   );
   if (view.truncated) parts.push(element('p', 'Показан ближайший участок графа: часть связей не поместилась в пределы ответа. Откройте связанную сущность, чтобы продолжить.', 'context-note'));

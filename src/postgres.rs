@@ -164,28 +164,60 @@ impl PostgresRepository {
         Ok(())
     }
 
-    fn upsert_json_rows<T: Serialize>(&mut self, table: &str, rows: &[T]) -> Result<()> {
-        const CHUNK: usize = 5_000;
-        for chunk in rows.chunks(CHUNK) {
-            let payload: Vec<_> = chunk
-                .iter()
-                .map(|row| {
-                    let data = serde_json::to_value(row)
-                        .map_err(|e| AtlasError::storage(e.to_string()))?;
-                    let id = data
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| AtlasError::storage("stored object missing id"))?
-                        .to_owned();
-                    Ok(serde_json::json!({"id": id, "data": data}))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let json =
-                serde_json::to_string(&payload).map_err(|e| AtlasError::storage(e.to_string()))?;
-            let sql = format!(
-                "INSERT INTO {table} (id,data) SELECT id, data FROM jsonb_to_recordset($1::jsonb) AS x(id text, data jsonb) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data"
-            );
-            self.query(&sql, &[&json])?;
+    fn upsert_nodes(&mut self, nodes: &[crate::domain::Node]) -> Result<()> {
+        const CHUNK: usize = 400;
+        for chunk in nodes.chunks(CHUNK) {
+            let mut json = String::with_capacity(chunk.len().saturating_mul(512).max(64));
+            json.push('[');
+            for (index, node) in chunk.iter().enumerate() {
+                if index > 0 {
+                    json.push(',');
+                }
+                json.push_str("{\"id\":");
+                json.push_str(
+                    &serde_json::to_string(&node.id)
+                        .map_err(|e| AtlasError::storage(e.to_string()))?,
+                );
+                json.push_str(",\"data\":");
+                json.push_str(
+                    &serde_json::to_string(node).map_err(|e| AtlasError::storage(e.to_string()))?,
+                );
+                json.push('}');
+            }
+            json.push(']');
+            self.query(
+                "INSERT INTO atlas_nodes (id,data) SELECT id, data FROM jsonb_to_recordset($1::jsonb) AS x(id text, data jsonb) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data",
+                &[&json],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn upsert_edges(&mut self, edges: &[crate::domain::Edge]) -> Result<()> {
+        const CHUNK: usize = 400;
+        for chunk in edges.chunks(CHUNK) {
+            let mut json = String::with_capacity(chunk.len().saturating_mul(512).max(64));
+            json.push('[');
+            for (index, edge) in chunk.iter().enumerate() {
+                if index > 0 {
+                    json.push(',');
+                }
+                json.push_str("{\"id\":");
+                json.push_str(
+                    &serde_json::to_string(&edge.id)
+                        .map_err(|e| AtlasError::storage(e.to_string()))?,
+                );
+                json.push_str(",\"data\":");
+                json.push_str(
+                    &serde_json::to_string(edge).map_err(|e| AtlasError::storage(e.to_string()))?,
+                );
+                json.push('}');
+            }
+            json.push(']');
+            self.query(
+                "INSERT INTO atlas_edges (id,data) SELECT id, data FROM jsonb_to_recordset($1::jsonb) AS x(id text, data jsonb) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data",
+                &[&json],
+            )?;
         }
         Ok(())
     }
@@ -274,6 +306,72 @@ impl Repository for PostgresRepository {
             &[&paths_json, &nodes_json],
         )
     }
+    fn protected_nodes_for_paths(
+        &mut self,
+        paths: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<Node>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let json = serde_json::to_string(paths).map_err(|e| AtlasError::storage(e.to_string()))?;
+        self.objects(
+            "SELECT data FROM atlas_nodes WHERE (data->>'trust')::int > 1 AND data->'span'->>'path' IN (SELECT jsonb_array_elements_text($1::jsonb))",
+            &[&json],
+        )
+    }
+    fn protected_edges_for_paths(
+        &mut self,
+        paths: &std::collections::BTreeSet<String>,
+        node_ids: &std::collections::BTreeSet<String>,
+    ) -> Result<Vec<Edge>> {
+        if paths.is_empty() && node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let paths_json =
+            serde_json::to_string(paths).map_err(|e| AtlasError::storage(e.to_string()))?;
+        let nodes_json =
+            serde_json::to_string(node_ids).map_err(|e| AtlasError::storage(e.to_string()))?;
+        self.objects(
+            "SELECT data FROM atlas_edges WHERE (data->>'trust')::int > 1 AND (data->'span'->>'path' IN (SELECT jsonb_array_elements_text($1::jsonb)) OR from_id IN (SELECT jsonb_array_elements_text($2::jsonb)) OR to_id IN (SELECT jsonb_array_elements_text($2::jsonb)))",
+            &[&paths_json, &nodes_json],
+        )
+    }
+    fn clear_analyzer_facts_for_paths(
+        &mut self,
+        paths: &std::collections::BTreeSet<String>,
+    ) -> Result<(usize, usize)> {
+        if paths.is_empty() {
+            return Ok((0, 0));
+        }
+        let json = serde_json::to_string(paths).map_err(|e| AtlasError::storage(e.to_string()))?;
+        // Edges first (path-scoped); node delete cascades remaining references.
+        let edges = self.query(
+            "WITH doomed AS (
+                DELETE FROM atlas_edges
+                WHERE COALESCE((data->>'trust')::int, 1) <= 1
+                  AND data->'span'->>'path' IN (SELECT jsonb_array_elements_text($1::jsonb))
+                RETURNING 1
+             ) SELECT count(*)::text FROM doomed",
+            &[&json],
+        )?;
+        let nodes = self.query(
+            "WITH doomed AS (
+                DELETE FROM atlas_nodes
+                WHERE COALESCE((data->>'trust')::int, 1) <= 1
+                  AND data->'span'->>'path' IN (SELECT jsonb_array_elements_text($1::jsonb))
+                RETURNING 1
+             ) SELECT count(*)::text FROM doomed",
+            &[&json],
+        )?;
+        let parse = |rows: Vec<Vec<Option<String>>>| {
+            rows.into_iter()
+                .next()
+                .and_then(|r| r.into_iter().next().flatten())
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0)
+        };
+        Ok((parse(nodes), parse(edges)))
+    }
     fn node(&mut self, id: &str) -> Result<Option<Node>> {
         Ok(self
             .objects("SELECT data FROM atlas_nodes WHERE id=$1", &[id])?
@@ -291,10 +389,10 @@ impl Repository for PostgresRepository {
         self.put_edges(std::slice::from_ref(e))
     }
     fn put_nodes(&mut self, nodes: &[Node]) -> Result<()> {
-        self.upsert_json_rows("atlas_nodes", nodes)
+        self.upsert_nodes(nodes)
     }
     fn put_edges(&mut self, edges: &[Edge]) -> Result<()> {
-        self.upsert_json_rows("atlas_edges", edges)
+        self.upsert_edges(edges)
     }
     fn delete_node(&mut self, id: &str) -> Result<()> {
         self.delete_nodes(&[id.to_owned()])
@@ -412,7 +510,7 @@ impl Repository for PostgresRepository {
                     ELSE 2
                   END AS score
                 FROM atlas_nodes, q
-                WHERE (id=$1 OR ($5 IN ('text','substring') AND ((strpos(lower(data->>'name'),lower($1))>0 AND lower(CASE WHEN $5='text' THEN regexp_replace(data->>'name', q.lit, ' ', 'g') ELSE data->>'name' END) ~ q.pat) OR (data->>'kind' IN ('class','method','function','property','trait','interface','enum','route','event','view','config_key') AND (strpos(lower(data->>'qualified_name'),lower($1))>0 AND lower(data->>'qualified_name') ~ q.pat)) OR (strpos(lower(coalesce(data->'metadata'->>'expression','')),lower($1))>0 AND lower(CASE WHEN $5='text' THEN regexp_replace(coalesce(data->'metadata'->>'expression',''), q.lit, ' ', 'g') ELSE coalesce(data->'metadata'->>'expression','') END) ~ q.pat) OR (strpos(lower(coalesce(data->'metadata'->>'value_expression','')),lower($1))>0 AND lower(CASE WHEN $5='text' THEN regexp_replace(coalesce(data->'metadata'->>'value_expression',''), q.lit, ' ', 'g') ELSE coalesce(data->'metadata'->>'value_expression','') END) ~ q.pat) OR (strpos(lower(coalesce(data->'metadata'->>'value_constant','')),lower($1))>0 AND lower(coalesce(data->'metadata'->>'value_constant','')) ~ q.pat) OR (strpos(lower(coalesce(data->'metadata'->>'member_name','')),lower($1))>0 AND lower(coalesce(data->'metadata'->>'member_name','')) ~ q.pat))) OR ($5='symbol' AND ((data->>'kind' IN ('class','method','function','variable','property','trait','interface','enum','route','event','view','config_key') AND (lower(ltrim(data->>'name','$'))=lower(ltrim($1,'$')) OR lower(data->>'qualified_name')=lower($1))) OR lower(ltrim(data->'metadata'->>'member_name','$'))=lower(ltrim($1,'$')) OR (data->'metadata'->>'value_constant' IS NOT NULL AND (lower(data->'metadata'->>'value_constant')=lower($1) OR lower(substring(data->'metadata'->>'value_constant' from '[^:]*$'))=lower(ltrim(regexp_replace($1,'^.*::',''),'$')) OR (strpos($1,'::')=0 AND lower(substring(data->'metadata'->>'value_constant' from '[^:]*$'))=lower(ltrim($1,'$'))))) OR (strpos($1,'::')>0 AND lower(ltrim(data->'metadata'->>'member_name','$'))=lower(ltrim(regexp_replace($1,'^.*::',''),'$')) AND EXISTS (SELECT 1 FROM (SELECT lower(regexp_replace($1,'::[^:]*$','')) AS own) o, (VALUES ('receiver_class'),('receiver_root_class')) AS v(cls), LATERAL unnest(string_to_array(translate(coalesce(data->'metadata'->>cls,''),'&','|'),'|')) AS part WHERE lower(btrim(part))=own OR right(lower(btrim(part)),length(own)+1)=chr(92)||own OR (strpos(own,chr(92))=0 AND lower(substring(btrim(part) from '[^\\]*$'))=own))))))
+                WHERE (id=$1 OR ($5 IN ('text','substring') AND ((strpos(lower(data->>'name'),lower($1))>0 AND lower(CASE WHEN $5='text' THEN regexp_replace(data->>'name', q.lit, ' ', 'g') ELSE data->>'name' END) ~ q.pat) OR (data->>'kind' IN ('class','method','function','property','trait','interface','enum','route','event','view','config_key') AND (strpos(lower(data->>'qualified_name'),lower($1))>0 AND lower(data->>'qualified_name') ~ q.pat)) OR (strpos(lower(coalesce(data->'metadata'->>'expression','')),lower($1))>0 AND lower(CASE WHEN $5='text' THEN regexp_replace(coalesce(data->'metadata'->>'expression',''), q.lit, ' ', 'g') ELSE coalesce(data->'metadata'->>'expression','') END) ~ q.pat) OR (strpos(lower(coalesce(data->'metadata'->>'value_expression','')),lower($1))>0 AND lower(CASE WHEN $5='text' THEN regexp_replace(coalesce(data->'metadata'->>'value_expression',''), q.lit, ' ', 'g') ELSE coalesce(data->'metadata'->>'value_expression','') END) ~ q.pat) OR (strpos(lower(coalesce(data->'metadata'->>'value_constant','')),lower($1))>0 AND lower(coalesce(data->'metadata'->>'value_constant','')) ~ q.pat) OR (strpos(lower(coalesce(data->'metadata'->>'member_name','')),lower($1))>0 AND lower(coalesce(data->'metadata'->>'member_name','')) ~ q.pat))) OR ($5='symbol' AND ((data->>'kind' IN ('class','method','function','variable','property','trait','interface','enum','route','event','view','config_key') AND (lower(ltrim(data->>'name','$'))=lower(ltrim($1,'$')) OR lower(data->>'qualified_name')=lower($1) OR (strpos($1,'::')>0 AND right(lower(data->>'qualified_name'),length($1)+1)=chr(92)||lower($1)))) OR lower(ltrim(data->'metadata'->>'member_name','$'))=lower(ltrim($1,'$')) OR (data->'metadata'->>'value_constant' IS NOT NULL AND (lower(data->'metadata'->>'value_constant')=lower($1) OR lower(substring(data->'metadata'->>'value_constant' from '[^:]*$'))=lower(ltrim(regexp_replace($1,'^.*::',''),'$')) OR (strpos($1,'::')=0 AND lower(substring(data->'metadata'->>'value_constant' from '[^:]*$'))=lower(ltrim($1,'$'))))) OR (strpos($1,'::')>0 AND lower(ltrim(data->'metadata'->>'member_name','$'))=lower(ltrim(regexp_replace($1,'^.*::',''),'$')) AND EXISTS (SELECT 1 FROM (SELECT lower(regexp_replace($1,'::[^:]*$','')) AS own) o, (VALUES ('receiver_class'),('receiver_root_class')) AS v(cls), LATERAL unnest(string_to_array(translate(coalesce(data->'metadata'->>cls,''),'&','|'),'|')) AS part WHERE lower(btrim(part))=own OR right(lower(btrim(part)),length(own)+1)=chr(92)||own OR (strpos(own,chr(92))=0 AND lower(reverse(split_part(reverse(btrim(part)), chr(92), 1)))=own))))))
                   AND ($3='' OR data->>'kind'=ANY(string_to_array($3,',')))
                   AND ($7='' OR coalesce(data->'span'->>'path','') !~ $7)
                   AND ($8='' OR coalesce(data->'span'->>'path','') ~ $8)

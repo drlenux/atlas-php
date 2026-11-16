@@ -20,6 +20,7 @@ index:
   # true: analyze vendor/ fully (slow on large projects).
   include_vendor: false
   # Library paths indexed for declarations only (classes, methods, PHPDoc), even with vendor excluded.
+  # Include every vendor prefix that app models extend (e.g. vendor/2amigos for Da\User), not only yiisoft.
   declaration_paths: [vendor/yiisoft]
   # php: always; add pgsql to index .sql/.pgsql files (SQL inside PHP createCommand/findBySql works with php alone).
   languages: [php]
@@ -30,7 +31,8 @@ index:
   max_file_bytes: 2097152          # largest analyzed source file
   max_analysis_bytes: 67108864     # total source text of one pass
   max_graph_elements: 2000000      # nodes + edges + diagnostics
-  analysis_timeout_secs: 120
+  # Full Slotor-sized passes with 1 CPU need ~10 min; raise further if analysis times out.
+  analysis_timeout_secs: 900
   debounce_ms: 5000                # wait after the last file change before reindexing
   poll_ms: 1000                    # file watcher period
 
@@ -48,6 +50,24 @@ mcp:
   max_context_nodes: 100
   max_context_depth: 3
   max_request_bytes: 1048576
+  # Drop noisy call/property lines from tool text (resolution token in [brackets]).
+  # Default when omitted: [name_only] (`[unresolved: name only]` guesses; the drop is
+  # stated as `# omitted name_only=N`). `[]` shows everything; `unresolved` also hides them.
+  # omit_resolutions: [name_only, unresolved, candidate]
+  # Optional bash hook: stdin = tool text, stdout = replacement. Env: ATLAS_MCP_TOOL, ATLAS_PROJECT_ROOT.
+  # response_script: .atlas/hooks/mcp-response.sh
+  # response_script_timeout_secs: 5
+
+# Optional file log (relative to the project root). Progress stays in docker logs;
+# this file holds selected parse gaps and/or MCP traffic after a restart.
+# Project sources stay read-only: bind-mount `.atlas` writable (see examples/compose.atlas.yml).
+# logging:
+#   file: .atlas/atlas.log
+#   parse_errors: true    # parse_error, unsupported_syntax, sql_statement_error, read_error, …
+#   parse_skips: true     # skipped SQL statements (not declaration_only unless declaration_skips)
+#   declaration_skips: false
+#   requests: false       # every MCP JSON-RPC request body (redacted/truncated)
+#   responses: false      # every MCP JSON-RPC response body (redacted/truncated)
 
 # Applications by folder. The prefix:
 # - labels every entity of the folder ([partner] in results) and is the `area` filter of

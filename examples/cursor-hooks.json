@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": ".atlas/hooks/php-search-hint.sh"
+      }
+    ]
+  }
+}

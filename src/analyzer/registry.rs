@@ -1,6 +1,9 @@
 use super::{AnalysisOptions, FrameworkPlugin, LanguagePlugin, SourceFile};
-use crate::domain::GraphSnapshot;
-use std::{collections::BTreeSet, path::Path};
+use crate::domain::{Edge, GraphSnapshot, Node};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 pub struct PluginRegistry {
     languages: Vec<Box<dyn LanguagePlugin>>,
@@ -94,7 +97,15 @@ impl PluginRegistry {
         self.validate(languages, frameworks)?;
         options.check(0)?;
         let mut result = GraphSnapshot::default();
-        for id in languages {
+        // Lightweight languages first: holding a finished PHP graph while starting
+        // pgsql tips 2 GiB cgroups over the edge after yii2 enrich.
+        let mut ordered: Vec<&String> = languages.iter().collect();
+        ordered.sort_by_key(|id| match id.as_str() {
+            "pgsql" => 0,
+            "php" => 1,
+            _ => 2,
+        });
+        for id in ordered {
             let language = self.language(id)?;
             options
                 .progress
@@ -150,9 +161,9 @@ impl PluginRegistry {
                 framework.enrich(&enrich_files, &mut graph, options)?;
             }
             super::sync_occurrence_resolution(&mut graph);
-            result.nodes.extend(graph.nodes);
-            result.edges.extend(graph.edges);
-            result.diagnostics.extend(graph.diagnostics);
+            // Languages share stable IDs (table:/schema: from SQL-in-PHP and .sql).
+            // Vec::extend would publish duplicates and fail apply_snapshot.
+            merge_language_graph(&mut result, graph);
             options.check(result.nodes.len() + result.edges.len() + result.diagnostics.len())?;
         }
         label_areas(&mut result, &options.areas);
@@ -173,6 +184,50 @@ impl PluginRegistry {
             .ok_or_else(|| format!("unknown framework plugin: {id}"))
     }
 }
+/// Fold another language graph into `into`, keeping one node/edge per ID.
+/// Prefer a non-`external` declaration; among equals prefer a `.sql`/`.pgsql`
+/// path so DDL wins over an SQL-in-PHP stub even when PHP runs after pgsql.
+fn merge_language_graph(into: &mut GraphSnapshot, from: GraphSnapshot) {
+    let mut nodes: BTreeMap<String, Node> =
+        into.nodes.drain(..).map(|n| (n.id.clone(), n)).collect();
+    for node in from.nodes {
+        let replace = match nodes.get(&node.id) {
+            None => true,
+            Some(existing) => {
+                let existing_external =
+                    existing.metadata.get("external") == Some(&serde_json::json!(true));
+                let incoming_external =
+                    node.metadata.get("external") == Some(&serde_json::json!(true));
+                match (existing_external, incoming_external) {
+                    (true, false) => true,
+                    (false, true) => false,
+                    _ => {
+                        let existing_sql = sql_source_path(&existing.span.path);
+                        let incoming_sql = sql_source_path(&node.span.path);
+                        match (existing_sql, incoming_sql) {
+                            (false, true) => true,
+                            (true, false) => false,
+                            _ => true, // same authority: later language wins
+                        }
+                    }
+                }
+            }
+        };
+        if replace {
+            nodes.insert(node.id.clone(), node);
+        }
+    }
+    into.nodes = nodes.into_values().collect();
+
+    let mut edges: BTreeMap<String, Edge> =
+        into.edges.drain(..).map(|e| (e.id.clone(), e)).collect();
+    for edge in from.edges {
+        edges.insert(edge.id.clone(), edge);
+    }
+    into.edges = edges.into_values().collect();
+    into.diagnostics.extend(from.diagnostics);
+}
+
 /// Every node under an area carries its prefix (`metadata.area`), whatever the plugin.
 fn label_areas(graph: &mut GraphSnapshot, areas: &[crate::domain::Area]) {
     if areas.is_empty() {
@@ -203,6 +258,13 @@ fn extension_matches(path: &str, extensions: &[&str]) -> bool {
                 .iter()
                 .any(|allowed| e.eq_ignore_ascii_case(allowed))
         })
+}
+
+fn sql_source_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("sql") || e.eq_ignore_ascii_case("pgsql"))
 }
 
 /// Collects members of every selected framework of one language (Mediator: the

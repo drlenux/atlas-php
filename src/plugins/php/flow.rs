@@ -60,12 +60,18 @@ fn analyze_with(
 ) -> Result<(), String> {
     let unit = project.units[function.unit].clone();
     // Start after the token that opens the body (`{`), so a leading `@var` counts.
-    let comment_cursor = function
-        .body
-        .and_then(|(start, _)| unit.tokens.get(start.saturating_sub(1)))
-        .map_or(usize::MAX, |opening| {
-            unit.comments.partition_point(|c| c.start < opening.end)
-        });
+    // File-scope bodies start at token 0 (no `{`): begin at the first comment so
+    // leading view `@var` annotations are not skipped.
+    let comment_cursor = match function.body {
+        Some((0, _)) => 0,
+        Some((start, _)) => unit
+            .tokens
+            .get(start.saturating_sub(1))
+            .map_or(0, |opening| {
+                unit.comments.partition_point(|c| c.start < opening.end)
+            }),
+        None => usize::MAX,
+    };
     let mut scope = Scope {
         project,
         function,
@@ -112,6 +118,18 @@ fn analyze_with(
                 string_value: None,
             },
         );
+    } else if let Some((start, _)) = function.body {
+        // File-scope / scripts: seed `@var` (incl. `$this`) before the first statement.
+        scope.read_annotations(start);
+        for (name, type_name) in scope.annotated_vars.clone() {
+            env.entry(name).or_insert_with(|| Binding {
+                type_name: type_name.clone(),
+                exact: false,
+                origins: vec![json!({"kind":"annotation"})],
+                annotated: true,
+                string_value: None,
+            });
+        }
     }
     if let Some((start, end)) = function.body {
         if function.arrow {
@@ -184,13 +202,51 @@ impl Scope<'_, '_> {
                 continue;
             }
             self.read_annotations(i);
-            if let Some(f) = self
-                .project
-                .functions
-                .values()
-                .find(|f| f.unit == self.function.unit && f.start == i)
+            // Nested decls only — do not skip the function currently being analyzed
+            // (file-scope bodies start at token 0 and would otherwise no-op).
+            if let Some(f) =
+                self.project.functions.values().find(|f| {
+                    f.id != self.function.id && f.unit == self.function.unit && f.start == i
+                })
             {
                 i = f.end;
+                continue;
+            }
+            // File-scope analysis: skip class-like declarations already owned by Project.
+            if let Some(c) = self
+                .project
+                .classes
+                .values()
+                .find(|c| c.unit == self.function.unit && c.start == i)
+            {
+                i = c.end;
+                continue;
+            }
+            if self.unit.is(i, "namespace") || self.unit.is(i, "use") || self.unit.is(i, "declare")
+            {
+                if self.unit.is(i, "namespace") {
+                    // `namespace Foo;` or `namespace Foo { … }` (body already has classes).
+                    let mut j = i + 1;
+                    while j < end && !self.unit.is(j, ";") && !self.unit.is(j, "{") {
+                        j += 1;
+                    }
+                    if self.unit.is(j, "{") {
+                        i = self.unit.pairs[j].map(|c| c + 1).unwrap_or(j + 1);
+                    } else {
+                        i = j.saturating_add(1);
+                    }
+                    continue;
+                }
+                if self.unit.is(i, "declare") && self.unit.is(i + 1, "(") {
+                    let close = self.unit.pairs[i + 1].unwrap_or(i + 1);
+                    i = close + 1;
+                    if self.unit.is(i, ";") {
+                        i += 1;
+                    }
+                    continue;
+                }
+                // `use …;`
+                i = self.unit.end_statement(i, end).saturating_add(1);
                 continue;
             }
             if self.unit.is(i, "return") {
@@ -236,7 +292,9 @@ impl Scope<'_, '_> {
                         current.iter().chain(&negative).cloned().collect::<Vec<_>>();
                     branch_conditions.push(condition.clone());
                     self.ensure_branch(keyword, next, after, &condition, &branch_conditions)?;
-                    if !self.block(a, b, &mut branch_env, &mut branch_conditions, depth + 1)? {
+                    if self.block(a, b, &mut branch_env, &mut branch_conditions, depth + 1)? {
+                        self.record_guard(&condition, (next, a, b, after), end);
+                    } else {
                         remaining.push((branch_env, branch_conditions));
                     }
                     negative.push(format!("!({condition})"));
@@ -337,14 +395,6 @@ impl Scope<'_, '_> {
                 }
                 self.block(a, b, &mut loop_env, &mut loop_conditions, depth + 1)?;
                 *env = merge([&*env, &loop_env]);
-                if keyword == "switch" {
-                    self.project.diagnostic(
-                        self.function.unit,
-                        i,
-                        "analysis_limitation",
-                        "Switch fallthrough reachability is approximate".into(),
-                    );
-                }
                 i = next;
                 continue;
             }
@@ -357,6 +407,9 @@ impl Scope<'_, '_> {
                 if stop == end {
                     return Err("case requires colon or semicolon".into());
                 }
+                // Each case/default is a fresh entry of the switch jump table: a prior
+                // `return`/`break` must not mark this arm unreachable_after_exit.
+                terminated = false;
                 conditions.push(self.unit.text(i, stop));
                 i = stop + 1;
                 continue;
@@ -372,12 +425,6 @@ impl Scope<'_, '_> {
                 if kind.eq_ignore_ascii_case("finally") && exits {
                     terminated = true;
                 }
-                self.project.diagnostic(
-                    self.function.unit,
-                    i,
-                    "analysis_limitation",
-                    format!("{kind} reachability is conservative"),
-                );
                 i = next;
                 continue;
             }
@@ -427,31 +474,104 @@ impl Scope<'_, '_> {
                 continue;
             }
             if ["break", "continue"].iter().any(|v| self.unit.is(i, v)) {
+                // Leaves the current switch arm / loop body; following statements in
+                // this sequential scan are dead until the next `case`/`default`.
+                terminated = true;
                 i = self.unit.end_statement(i, end).saturating_add(1);
                 continue;
-            }
-            let stop = self.unit.end_statement(i, end);
-            if stop == end {
-                return Err(format!(
-                    "statement is missing semicolon at line {}",
-                    self.unit.tokens[i].line
-                ));
             }
             let begin = if self.unit.is(i, "echo") || self.unit.is(i, "print") {
                 i + 1
             } else {
                 i
             };
-            if begin < stop {
-                let expr = expression::parse(&self.unit, begin, stop)?;
+            let stop = self.unit.end_statement(i, end);
+            // Views / short-echo `<?= … ?>` often omit `;` before `?>` (no token).
+            // Accept a trailing expression at the end of the analyzed span.
+            let (expr_end, advance) = if stop < end {
+                (stop, stop + 1)
+            } else if begin < end && expression::parse(&self.unit, begin, end).is_ok() {
+                (end, end)
+            } else {
+                return Err(format!(
+                    "statement is missing semicolon at line {}",
+                    self.unit.tokens[i].line
+                ));
+            };
+            if begin < expr_end {
+                let expr = expression::parse(&self.unit, begin, expr_end)?;
                 self.walk(&expr, env, &current)?;
                 if self.unit.is(i, "throw") || self.unit.is(i, "exit") {
                     terminated = true;
                 }
             }
-            i = stop + 1;
+            i = advance;
         }
         Ok(terminated)
+    }
+    /// Stores an early-exit `if` branch as `metadata.guards` of the analyzed function, so
+    /// callers can show the checks that precede a call (`isLockTakeBonuses` before
+    /// `createFreeSpin`). `span` is `(keyword, body start, body end, after statement)`;
+    /// `scope_end` is the end of the enclosing block: the guard applies to later sites
+    /// inside that block only.
+    fn record_guard(
+        &mut self,
+        condition: &str,
+        span: (usize, usize, usize, usize),
+        scope_end: usize,
+    ) {
+        let (keyword, body_start, body_end, after) = span;
+        let tokens = &self.unit.tokens;
+        let (Some(first), Some(last)) = (tokens.get(keyword), tokens.get(after.saturating_sub(1)))
+        else {
+            return;
+        };
+        let scope_line = tokens
+            .get(scope_end)
+            .or(tokens.last())
+            .map_or(last.line, |t| t.line);
+        let guard = json!({
+            "line": first.line,
+            "end_line": last.line,
+            "scope_end_line": scope_line,
+            "condition": clip_text(condition.split_whitespace().collect::<Vec<_>>().join(" "), GUARD_CONDITION_MAX),
+            "exit": self.exit_kind(body_start, body_end),
+        });
+        let Some(node) = self.project.nodes.get_mut(&self.function.id) else {
+            return;
+        };
+        if !node.metadata["guards"].is_array() {
+            node.metadata["guards"] = json!([]);
+        }
+        if let Some(guards) = node.metadata["guards"].as_array_mut() {
+            if guards.len() < GUARDS_PER_FUNCTION {
+                guards.push(guard);
+            }
+        }
+    }
+
+    /// Statement-level exit keyword of a terminating branch (nested blocks, calls and
+    /// closures are skipped); `exit` when the branch ends through nested control flow.
+    fn exit_kind(&self, start: usize, end: usize) -> &'static str {
+        let mut p = start;
+        while p < end {
+            if matches!(self.unit.tokens[p].text.as_str(), "{" | "(" | "[") {
+                if let Some(close) = self.unit.pairs[p] {
+                    p = close + 1;
+                    continue;
+                }
+            }
+            match self.unit.tokens[p].text.to_ascii_lowercase().as_str() {
+                "return" => return "return",
+                "throw" => return "throw",
+                "continue" => return "continue",
+                "break" => return "break",
+                "exit" | "die" => return "exit",
+                _ => {}
+            }
+            p += 1;
+        }
+        "exit"
     }
     fn body(&self, start: usize, end: usize) -> Result<(usize, usize, usize), String> {
         if self.unit.is(start, "{") {
@@ -538,14 +658,33 @@ impl Scope<'_, '_> {
                 let call = self.resolve(expr, env);
                 // Argument types let framework plugins follow values passed to calls
                 // (e.g. a job pushed to a queue) without re-analyzing expressions.
+                let labeled: Vec<Option<String>> = args
+                    .iter()
+                    .map(|arg| argument_label(&self.unit, arg))
+                    .collect();
+                // Named args / array keys are what callers-output must keep when the
+                // expression is clipped, so such calls also store clipped values.
+                let structured = labeled.iter().any(Option::is_some)
+                    || args.iter().any(|arg| matches!(&arg.kind, Kind::Array(items) if items.iter().any(|i| i.key.is_some())));
                 let arguments: Vec<Value> = args
                     .iter()
-                    .map(|arg| {
+                    .zip(labeled)
+                    .map(|(arg, label)| {
                         let typed = self.typed(arg, env);
                         let mut value = json!({
                             "type": typed.name,
                             "type_source": super::type_source(typed.annotated),
                         });
+                        // `...$args` expands to an unknown number of arguments.
+                        if matches!(&arg.kind, Kind::Unary(op, _) if op == "...") {
+                            value["spread"] = json!(true);
+                        }
+                        if structured {
+                            value["value"] = json!(clip_text(self.unit.text(arg.start, arg.end), ARG_VALUE_MAX));
+                            if let Some(label) = label {
+                                value["name"] = json!(label);
+                            }
+                        }
                         // Array literal keys+value types (render params, config maps).
                         if let Kind::Array(items) = &arg.kind {
                             let items: Vec<Value> = items
@@ -556,6 +695,7 @@ impl Scope<'_, '_> {
                                     let typed = self.typed(&item.value, env);
                                     Some(json!({
                                         "name": name,
+                                        "value": clip_text(self.unit.text(item.value.start, item.value.end), ARG_VALUE_MAX),
                                         "type": typed.name,
                                         "type_source": super::type_source(typed.annotated),
                                     }))
@@ -568,7 +708,12 @@ impl Scope<'_, '_> {
                         value
                     })
                     .collect();
-                let mut metadata = json!({"arguments":arguments,"expression":self.unit.text(expr.start,expr.end),"conditions":conditions,"resolution":call.resolution,"type_source":super::type_source(call.annotated),"candidates":call.candidates,"receiver_class":call.receiver_class,"receiver_expression":call.receiver_expression,"receiver_root_class":call.receiver_root_class,"member_name":member,"operation":"call","dispatcher":call.dispatcher,"unindexed_ancestor":call.unindexed_ancestor,"builtin":call.builtin.as_ref().map(|(name, _)| name)});
+                let mut metadata = json!({"arguments":arguments,"expression":clip_expr(self.unit.text(expr.start,expr.end)),"conditions":conditions,"resolution":call.resolution,"type_source":super::type_source(call.annotated),"candidates":call.candidates,"receiver_class":call.receiver_class,"receiver_expression":clip_expr(call.receiver_expression.clone()),"receiver_root_class":call.receiver_root_class,"member_name":member,"operation":"call","dispatcher":call.dispatcher,"unindexed_ancestor":call.unindexed_ancestor,"builtin":call.builtin.as_ref().map(|(name, _)| name)});
+                if structured {
+                    if let Some(open) = self.unit.pairs[expr.end - 1].filter(|o| *o < expr.end) {
+                        metadata["callee"] = json!(clip_expr(self.unit.text(expr.start, open)));
+                    }
+                }
                 if call.undeclared {
                     metadata["undeclared"] = json!(true);
                 }
@@ -602,6 +747,16 @@ impl Scope<'_, '_> {
                 }
                 // Mass-assignment helpers: updateAttributes(['field'=>…]) → write_site per key.
                 self.mass_assignment_writes(
+                    member,
+                    args,
+                    expr,
+                    &call.receiver_class,
+                    &call.receiver_expression,
+                    env,
+                    conditions,
+                )?;
+                // Query Builder / AR: where/select/batchInsert → attribute/column access.
+                self.query_builder_fields(
                     member,
                     args,
                     expr,
@@ -671,6 +826,8 @@ impl Scope<'_, '_> {
                 self.walk_expr(base, env, conditions, true)?;
                 if let Some(index) = index {
                     self.walk_expr(index, env, conditions, true)?;
+                    self.attributes_bag_access(base, index, false, env, conditions, None)?;
+                    self.model_array_access(base, index, false, env, conditions, None)?;
                 }
             }
             Kind::Cast { expr: inner, .. } => self.walk_expr(inner, env, conditions, true)?,
@@ -743,6 +900,12 @@ impl Scope<'_, '_> {
                         self.walk_expr(key, env, conditions, true)?;
                     }
                     self.walk_expr(&item.value, env, conditions, true)?;
+                }
+            }
+            Kind::Match { subject, arms } => {
+                self.walk_expr(subject, env, conditions, true)?;
+                for arm in arms {
+                    self.walk_expr(arm, env, conditions, true)?;
                 }
             }
             Kind::Unknown(children) => {
@@ -827,6 +990,8 @@ impl Scope<'_, '_> {
             self.walk_expr(base, env, conditions, true)?;
             if let Some(index) = index {
                 self.walk_expr(index, env, conditions, true)?;
+                self.attributes_bag_access(base, index, true, env, conditions, Some(rhs))?;
+                self.model_array_access(base, index, true, env, conditions, Some(rhs))?;
             }
         } else {
             self.walk_expr(lhs, env, conditions, true)?;
@@ -894,7 +1059,7 @@ impl Scope<'_, '_> {
             "property_access"
         };
         let site_kind = if write { "write_site" } else { "read_site" };
-        let mut metadata = json!({"receiver_class":class,"receiver_expression":self.unit.text(receiver.start,receiver.end),"receiver_root_class":self.root_class(receiver),"member_name":name,"operation":if write{"write"}else{"read"},"nullsafe":nullsafe,"expression":self.unit.text(expr.start,expr.end),"conditions":conditions,"dispatcher":dispatcher,"type_source":super::type_source(annotated)});
+        let mut metadata = json!({"receiver_class":class,"receiver_expression":clip_expr(self.unit.text(receiver.start,receiver.end)),"receiver_root_class":self.root_class(receiver),"member_name":name,"operation":if write{"write"}else{"read"},"nullsafe":nullsafe,"expression":clip_expr(self.unit.text(expr.start,expr.end)),"conditions":conditions,"dispatcher":dispatcher,"type_source":super::type_source(annotated)});
         if write {
             if let Some(rhs) = assigned {
                 self.attach_assigned_value(&mut metadata, rhs, env);
@@ -1055,19 +1220,78 @@ impl Scope<'_, '_> {
                 };
                 self.array_field_writes(items)
             }
-            "load" => {
-                // load($data) or load($data, 'FormName') — keys may be nested under form name.
-                let Some(Kind::Array(items)) = args.first().map(|a| &a.kind) else {
+            "load" | "loadmultiple" => {
+                // load($data) / load($data, 'FormName') — literal keys; else all known attrs.
+                let Some(first) = args.first() else {
                     return Ok(());
                 };
-                let mut fields = self.array_field_writes(items);
-                // Nested form: ['User' => ['phone' => …]]
-                for item in items {
-                    if let Kind::Array(nested) = &item.value.kind {
-                        fields.extend(self.array_field_writes(nested));
+                if let Kind::Array(items) = &first.kind {
+                    let mut fields = self.array_field_writes(items);
+                    for item in items {
+                        if let Kind::Array(nested) = &item.value.kind {
+                            fields.extend(self.array_field_writes(nested));
+                        }
                     }
+                    if !fields.is_empty() {
+                        fields
+                    } else {
+                        return self.emit_known_attribute_writes(
+                            member,
+                            call,
+                            &if informative(receiver_class) {
+                                receiver_class.to_owned()
+                            } else {
+                                "unknown".into()
+                            },
+                            receiver_expression,
+                            conditions,
+                            "load",
+                        );
+                    }
+                } else {
+                    return self.emit_known_attribute_writes(
+                        member,
+                        call,
+                        &if informative(receiver_class) {
+                            receiver_class.to_owned()
+                        } else {
+                            "unknown".into()
+                        },
+                        receiver_expression,
+                        conditions,
+                        "load",
+                    );
                 }
-                fields
+            }
+            "save" | "insert" | "upsert" => {
+                return self.emit_known_attribute_writes(
+                    member,
+                    call,
+                    &if informative(receiver_class) {
+                        receiver_class.to_owned()
+                    } else {
+                        "unknown".into()
+                    },
+                    receiver_expression,
+                    conditions,
+                    member_l.as_str(),
+                );
+            }
+            "delete" => {
+                // Known attrs as reads (row identity used by delete).
+                return self.emit_known_attribute_access(
+                    member,
+                    call,
+                    &if informative(receiver_class) {
+                        receiver_class.to_owned()
+                    } else {
+                        "unknown".into()
+                    },
+                    receiver_expression,
+                    conditions,
+                    "delete",
+                    false,
+                );
             }
             _ => return Ok(()),
         };
@@ -1118,6 +1342,572 @@ impl Scope<'_, '_> {
             )?;
         }
         Ok(())
+    }
+
+    /// `$model->attributes['field']` / `$model->attributes["field"] = …`
+    fn attributes_bag_access(
+        &mut self,
+        base: &Expr,
+        index: &Expr,
+        write: bool,
+        env: &Env,
+        conditions: &[String],
+        assigned: Option<&Expr>,
+    ) -> Result<(), String> {
+        let Kind::Property {
+            receiver,
+            member,
+            dynamic,
+            ..
+        } = &base.kind
+        else {
+            return Ok(());
+        };
+        if *dynamic || !member.eq_ignore_ascii_case("attributes") {
+            return Ok(());
+        }
+        let Some(field) = self.expr_string(index) else {
+            return Ok(());
+        };
+        if !identifier_name(&field) {
+            return Ok(());
+        }
+        let receiver_type = self.receiver_type(receiver, false, env);
+        self.emit_attribute_effect(
+            &field,
+            &receiver_type.name,
+            &self.unit.text(receiver.start, receiver.end),
+            write,
+            index.start,
+            index.end,
+            conditions,
+            assigned,
+            env,
+            "attributes_bag",
+        )
+    }
+
+    /// `$model['field']` ArrayAccess on ActiveRecord/Model.
+    fn model_array_access(
+        &mut self,
+        base: &Expr,
+        index: &Expr,
+        write: bool,
+        env: &Env,
+        conditions: &[String],
+        assigned: Option<&Expr>,
+    ) -> Result<(), String> {
+        // Only bare receivers (variable/property), not `$x->attributes[...]` (handled above).
+        if matches!(&base.kind, Kind::Property { member, .. } if member.eq_ignore_ascii_case("attributes"))
+        {
+            return Ok(());
+        }
+        let Some(field) = self.expr_string(index) else {
+            return Ok(());
+        };
+        if !identifier_name(&field) {
+            return Ok(());
+        }
+        let receiver_type = match &base.kind {
+            Kind::Variable(_) | Kind::Property { .. } | Kind::Call { .. } => {
+                self.typed(base, env).name
+            }
+            _ => return Ok(()),
+        };
+        if !informative(&receiver_type) {
+            return Ok(());
+        }
+        // Only when the field is a known (possibly framework) property of the class.
+        let known = class_parts(&receiver_type).iter().any(|part| {
+            self.project
+                .lookup_property(erase(part), &field, &mut BTreeSet::new())
+                .is_some()
+        });
+        if !known {
+            return Ok(());
+        }
+        self.emit_attribute_effect(
+            &field,
+            &receiver_type,
+            &self.unit.text(base.start, base.end),
+            write,
+            index.start,
+            index.end,
+            conditions,
+            assigned,
+            env,
+            "array_access",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_attribute_effect(
+        &mut self,
+        field: &str,
+        receiver_class: &str,
+        receiver_expression: &str,
+        write: bool,
+        start: usize,
+        end: usize,
+        conditions: &[String],
+        assigned: Option<&Expr>,
+        env: &Env,
+        evidence: &str,
+    ) -> Result<(), String> {
+        let target = class_parts(receiver_class).iter().find_map(|part| {
+            self.project
+                .lookup_property(erase(part), field, &mut BTreeSet::new())
+        });
+        let kind = if target.is_some() {
+            if write {
+                "writes"
+            } else {
+                "reads"
+            }
+        } else {
+            "property_access"
+        };
+        let site_kind = if write { "write_site" } else { "read_site" };
+        let mut meta = json!({
+            "expression": format!("{field} via {evidence}"),
+            "conditions": conditions,
+            "member_name": field,
+            "operation": if write { "write" } else { "read" },
+            "receiver_class": receiver_class,
+            "receiver_expression": clip_expr(receiver_expression.to_owned()),
+            "resolution": if target.is_some() { "resolved" } else { "unresolved" },
+            "framework_evidence": evidence,
+        });
+        if write {
+            if let Some(rhs) = assigned {
+                self.attach_assigned_value(&mut meta, rhs, env);
+            }
+        }
+        self.emit_effect(kind, site_kind, target, start, end, meta, conditions)
+    }
+
+    /// `load($post)` / `save()` without a literal map → site per known model attribute.
+    fn emit_known_attribute_writes(
+        &mut self,
+        member: &str,
+        call: &Expr,
+        receiver_class: &str,
+        receiver_expression: &str,
+        conditions: &[String],
+        evidence: &str,
+    ) -> Result<(), String> {
+        self.emit_known_attribute_access(
+            member,
+            call,
+            receiver_class,
+            receiver_expression,
+            conditions,
+            evidence,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_known_attribute_access(
+        &mut self,
+        member: &str,
+        call: &Expr,
+        receiver_class: &str,
+        receiver_expression: &str,
+        conditions: &[String],
+        evidence: &str,
+        write: bool,
+    ) -> Result<(), String> {
+        let mut fields = BTreeSet::new();
+        for part in class_parts(receiver_class) {
+            let key = erase(&part);
+            let Some(class) = self.project.classes.get(key) else {
+                continue;
+            };
+            for prop in &class.properties {
+                if identifier_name(&prop.name) {
+                    fields.insert(prop.name.clone());
+                }
+            }
+        }
+        let recv_expr = if receiver_expression.is_empty() {
+            "$this"
+        } else {
+            receiver_expression
+        };
+        for field in fields {
+            let target = class_parts(receiver_class).iter().find_map(|part| {
+                self.project
+                    .lookup_property(erase(part), &field, &mut BTreeSet::new())
+            });
+            let meta = json!({
+                "expression": format!("{field} via {member}"),
+                "conditions": conditions,
+                "member_name": field,
+                "operation": if write { "write" } else { "read" },
+                "receiver_class": receiver_class,
+                "receiver_expression": recv_expr,
+                "resolution": if target.is_some() { "resolved" } else { "unresolved" },
+                "framework_evidence": evidence,
+                "call_expression": self.unit.text(call.start, call.end),
+                "mass_load": true,
+            });
+            let (edge_kind, site_kind) = if write {
+                (
+                    if target.is_some() {
+                        "writes"
+                    } else {
+                        "property_access"
+                    },
+                    "write_site",
+                )
+            } else {
+                (
+                    if target.is_some() {
+                        "reads"
+                    } else {
+                        "property_access"
+                    },
+                    "read_site",
+                )
+            };
+            self.emit_effect(
+                edge_kind, site_kind, target, call.start, call.end, meta, conditions,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// ActiveQuery/Query hash conditions and select lists → attribute R/W.
+    #[allow(clippy::too_many_arguments)]
+    fn query_builder_fields(
+        &mut self,
+        member: &str,
+        args: &[Expr],
+        call: &Expr,
+        receiver_class: &str,
+        receiver_expression: &str,
+        env: &Env,
+        conditions: &[String],
+    ) -> Result<(), String> {
+        let member_l = member.to_ascii_lowercase();
+        let model = model_from_query_context(
+            receiver_class,
+            receiver_expression,
+            self.function.class.as_deref().unwrap_or(""),
+        );
+        match member_l.as_str() {
+            "where" | "andwhere" | "orwhere" | "filterwhere" | "andfilterwhere"
+            | "orfilterwhere" | "oncondition" | "andoncondition" => {
+                let Some(arg) = args.first() else {
+                    return Ok(());
+                };
+                for (field, start, end) in self.condition_fields(arg) {
+                    self.emit_attribute_effect(
+                        &field,
+                        &model,
+                        receiver_expression,
+                        false,
+                        start,
+                        end,
+                        conditions,
+                        None,
+                        env,
+                        "query_builder",
+                    )?;
+                }
+            }
+            "select" | "addselect" | "groupby" | "orderby" | "addorderby" => {
+                let Some(arg) = args.first() else {
+                    return Ok(());
+                };
+                for (field, start, end) in self.select_fields(arg) {
+                    self.emit_attribute_effect(
+                        &field,
+                        &model,
+                        receiver_expression,
+                        false,
+                        start,
+                        end,
+                        conditions,
+                        None,
+                        env,
+                        "query_builder",
+                    )?;
+                }
+            }
+            "updateall" | "updateallcounters" => {
+                // First arg writes already handled by mass_assignment; second = condition reads.
+                if let Some(cond) = args.get(1) {
+                    for (field, start, end) in self.condition_fields(cond) {
+                        self.emit_attribute_effect(
+                            &field,
+                            &model,
+                            receiver_expression,
+                            false,
+                            start,
+                            end,
+                            conditions,
+                            None,
+                            env,
+                            "query_builder",
+                        )?;
+                    }
+                }
+            }
+            "batchinsert" => {
+                // batchInsert($table, ['a','b'], $rows)
+                let cols = args.get(1).and_then(|a| match &a.kind {
+                    Kind::Array(items) => Some(items),
+                    _ => None,
+                });
+                if let Some(items) = cols {
+                    for item in items {
+                        if let Some(name) = self.expr_string(&item.value) {
+                            if identifier_name(&name) {
+                                self.emit_attribute_effect(
+                                    &name,
+                                    &model,
+                                    receiver_expression,
+                                    true,
+                                    item.value.start,
+                                    item.value.end,
+                                    conditions,
+                                    None,
+                                    env,
+                                    "batch_insert",
+                                )?;
+                            }
+                        }
+                    }
+                }
+                let _ = call;
+            }
+            "joinwith" | "innerjoinwith" | "with" => {
+                let Some(arg) = args.first() else {
+                    return Ok(());
+                };
+                for (rel, start, end) in self.relation_names(arg) {
+                    self.emit_join_with_relation(
+                        &rel,
+                        &model,
+                        receiver_expression,
+                        start,
+                        end,
+                        conditions,
+                    )?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// `joinWith('bonus')` / `with(['user', 'wallet'])` → relation property (+ getter).
+    fn relation_names(&self, expr: &Expr) -> Vec<(String, usize, usize)> {
+        match &expr.kind {
+            Kind::Literal(_) => self
+                .expr_string(expr)
+                .filter(|n| identifier_name(n))
+                .map(|n| vec![(n, expr.start, expr.end)])
+                .unwrap_or_default(),
+            Kind::Array(items) => {
+                let mut out = Vec::new();
+                for item in items {
+                    // ['bonus', 'user' => fn…] — keys or bare string values
+                    if let Some(key) = &item.key {
+                        if let Some(name) = self.expr_string(key) {
+                            if identifier_name(&name) {
+                                out.push((name, key.start, key.end));
+                            }
+                        }
+                    } else if let Some(name) = self.expr_string(&item.value) {
+                        if identifier_name(&name) {
+                            out.push((name, item.value.start, item.value.end));
+                        }
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn emit_join_with_relation(
+        &mut self,
+        relation: &str,
+        model: &str,
+        receiver_expression: &str,
+        start: usize,
+        end: usize,
+        conditions: &[String],
+    ) -> Result<(), String> {
+        let prop = class_parts(model).iter().find_map(|part| {
+            self.project
+                .lookup_property(erase(part), relation, &mut BTreeSet::new())
+        });
+        let getter_name = {
+            let mut chars = relation.chars();
+            let upper = chars
+                .next()
+                .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default();
+            format!("get{upper}")
+        };
+        let getter = class_parts(model).iter().find_map(|part| {
+            self.project
+                .lookup_method(erase(part), &getter_name, &mut BTreeSet::new())
+        });
+        if let Some(prop_id) = prop {
+            let meta = json!({
+                "expression": format!("joinWith/with {relation}"),
+                "conditions": conditions,
+                "member_name": relation,
+                "operation": "read",
+                "receiver_class": model,
+                "receiver_expression": clip_expr(receiver_expression.to_owned()),
+                "resolution": "resolved",
+                "framework_evidence": "join_with",
+            });
+            self.emit_effect(
+                "reads",
+                "read_site",
+                Some(prop_id),
+                start,
+                end,
+                meta,
+                conditions,
+            )?;
+        }
+        if let Some(getter_id) = getter {
+            let meta = json!({
+                "expression": format!("joinWith/with {relation} → {getter_name}"),
+                "conditions": conditions,
+                "member_name": getter_name,
+                "operation": "call",
+                "receiver_class": model,
+                "receiver_expression": clip_expr(receiver_expression.to_owned()),
+                "resolution": "resolved",
+                "framework_evidence": "join_with",
+            });
+            self.emit_effect(
+                "calls",
+                "call_site",
+                Some(getter_id),
+                start,
+                end,
+                meta,
+                conditions,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn condition_fields(&self, expr: &Expr) -> Vec<(String, usize, usize)> {
+        let Kind::Array(items) = &expr.kind else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        // Hash: ['status' => 1, 'and', [...]]
+        for item in items {
+            if let Some(key) = &item.key {
+                if let Some(name) = self.expr_string(key) {
+                    if identifier_name(&name) {
+                        out.push((name, key.start, key.end));
+                    }
+                }
+                if let Kind::Array(_) = &item.value.kind {
+                    out.extend(self.condition_fields(&item.value));
+                }
+            } else {
+                match &item.value.kind {
+                    Kind::Array(_) => out.extend(self.condition_fields(&item.value)),
+                    Kind::Literal(_) => {
+                        // Operator form: ['=', 'status', 1] — second string is column.
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Operator form without keys: ['=', 'col', val] or ['in', 'col', [...]]
+        let values: Vec<&Expr> = items
+            .iter()
+            .filter(|i| i.key.is_none())
+            .map(|i| &i.value)
+            .collect();
+        if values.len() >= 2 {
+            if let Some(op) = self.expr_string(values[0]) {
+                let op_l = op.to_ascii_lowercase();
+                if matches!(
+                    op_l.as_str(),
+                    "=" | "=="
+                        | "!="
+                        | "<>"
+                        | ">"
+                        | ">="
+                        | "<"
+                        | "<="
+                        | "in"
+                        | "not in"
+                        | "like"
+                        | "ilike"
+                        | "between"
+                        | "not between"
+                        | "is"
+                        | "is not"
+                ) {
+                    if let Some(name) = self.expr_string(values[1]) {
+                        if identifier_name(&name) {
+                            out.push((name, values[1].start, values[1].end));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn select_fields(&self, expr: &Expr) -> Vec<(String, usize, usize)> {
+        match &expr.kind {
+            Kind::Literal(_) => {
+                if let Some(raw) = self.expr_string(expr) {
+                    raw.split(',')
+                        .filter_map(|part| {
+                            let name = part
+                                .split_whitespace()
+                                .next()?
+                                .rsplit('.')
+                                .next()?
+                                .trim_matches('`')
+                                .trim_matches('"');
+                            identifier_name(name).then_some((name.to_owned(), expr.start, expr.end))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+            Kind::Array(items) => {
+                let mut out = Vec::new();
+                for item in items {
+                    // ['amount', 'id'] or ['a' => 'amount']
+                    if let Some(name) = self.expr_string(&item.value) {
+                        let name = name.rsplit('.').next().unwrap_or(&name);
+                        if identifier_name(name) {
+                            out.push((name.to_owned(), item.value.start, item.value.end));
+                        }
+                    } else if let Some(key) = &item.key {
+                        if let Some(name) = self.expr_string(key) {
+                            if identifier_name(&name) {
+                                out.push((name, key.start, key.end));
+                            }
+                        }
+                    }
+                }
+                out
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn expr_string(&self, expr: &Expr) -> Option<String> {
@@ -1172,7 +1962,22 @@ impl Scope<'_, '_> {
         if let Kind::Variable(name) = &arg.kind {
             return env.get(name).and_then(|b| b.string_value.clone());
         }
-        None
+        // `"SELECT …".$id." …"` — only when every fragment is a recoverable string literal.
+        self.concat_string_literals(arg, env)
+    }
+
+    /// Concatenate `.` / `.=` chains of string literals (and vars with known string_value).
+    fn concat_string_literals(&self, expr: &Expr, env: &Env) -> Option<String> {
+        match &expr.kind {
+            Kind::Literal(_) => self.expr_string(expr),
+            Kind::Variable(name) => env.get(name).and_then(|b| b.string_value.clone()),
+            Kind::Binary(op, left, right) if op == "." => {
+                let left = self.concat_string_literals(left, env)?;
+                let right = self.concat_string_literals(right, env)?;
+                Some(format!("{left}{right}"))
+            }
+            _ => None,
+        }
     }
 
     fn array_field_writes(
@@ -1342,8 +2147,9 @@ impl Scope<'_, '_> {
     ) {
         let type_name = expr.map_or_else(|| "null".into(), |e| self.type_of(e, env));
         let origins = expr.map(|e| self.origins(e, env)).unwrap_or_default();
-        let expression = expr.map(|e| self.unit.text(e.start, e.end));
-        let value = json!({"line":self.unit.tokens[start].line,"span":self.unit.span(start,end),"expression":expression,"type":type_name,"conditions":conditions,"snippet":self.unit.snippet(start,end),"origins":origins,"kind":kind});
+        // No multi-line `snippet`: it duplicated source into every return and blew 2 GiB.
+        let expression = expr.map(|e| clip_expr(self.unit.text(e.start, e.end)));
+        let value = json!({"line":self.unit.tokens[start].line,"span":self.unit.span(start,end),"expression":expression,"type":type_name,"conditions":conditions,"origins":origins,"kind":kind});
         self.project
             .nodes
             .get_mut(&self.function.id)
@@ -1700,7 +2506,20 @@ impl Scope<'_, '_> {
             Kind::Unary(_, rhs) => self.typed(rhs, env),
             Kind::Binary(op, a, b) => {
                 if [
-                    "===", "!==", "==", "!=", "<", ">", "<=", ">=", "&&", "||", "and", "or",
+                    "===",
+                    "!==",
+                    "==",
+                    "!=",
+                    "<",
+                    ">",
+                    "<=",
+                    ">=",
+                    "<=>",
+                    "&&",
+                    "||",
+                    "and",
+                    "or",
+                    "instanceof",
                 ]
                 .contains(&op.as_str())
                 {
@@ -1844,12 +2663,94 @@ impl Scope<'_, '_> {
                 } else {
                     self.callable_arg_return(args).unwrap_or(typed)
                 };
-                // ActiveQuery<T>::batch/each → T[][] / T[] (vendor returns BatchQueryResult).
+                // Fluent Query methods keep ActiveQuery<T>; batch/each unwrap T.
+                let typed = self.query_fluent_return(member, &call, typed);
                 self.query_batch_return(member, &call, typed)
+            }
+            Kind::Match { arms, .. } => {
+                if arms.is_empty() {
+                    Typed::unknown()
+                } else {
+                    let types: Vec<Typed> = arms.iter().map(|arm| self.typed(arm, env)).collect();
+                    Typed {
+                        name: union(types.iter().map(|t| t.name.as_str())),
+                        annotated: types.iter().any(|t| t.annotated),
+                        exact: false,
+                    }
+                }
             }
             _ => Typed::unknown(),
         }
     }
+    /// `ActiveQuery<T>::where/select/…` → keep `ActiveQuery<T>` (not bare ActiveQuery).
+    fn query_fluent_return(&self, member: &str, call: &Call, typed: Typed) -> Typed {
+        const FLUENT: &[&str] = &[
+            "where",
+            "andwhere",
+            "orwhere",
+            "filterwhere",
+            "andfilterwhere",
+            "orfilterwhere",
+            "select",
+            "addselect",
+            "orderby",
+            "addorderby",
+            "groupby",
+            "having",
+            "andhaving",
+            "orhaving",
+            "limit",
+            "offset",
+            "indexby",
+            "joinwith",
+            "innerjoinwith",
+            "with",
+            "join",
+            "innerjoin",
+            "leftjoin",
+            "rightjoin",
+            "oncondition",
+            "andoncondition",
+            "asarray",
+            "withquery",
+        ];
+        let name = member.to_ascii_lowercase();
+        if !FLUENT.contains(&name.as_str()) {
+            return typed;
+        }
+        let source = if informative(&call.matched.name) {
+            call.matched.name.as_str()
+        } else {
+            call.receiver_class.as_str()
+        };
+        let preserved = class_parts(source).into_iter().find_map(|part| {
+            let arg = type_argument(&part)?;
+            if !informative(arg) {
+                return None;
+            }
+            let open = part.find('<')?;
+            Some(format!("{}<{arg}>", &part[..open]))
+        });
+        let Some(query_ty) = preserved else {
+            return typed;
+        };
+        // Only override when we would otherwise lose the type argument.
+        let loses_arg = class_parts(&typed.name).iter().any(|p| {
+            let lower = p.to_ascii_lowercase();
+            (lower.contains("activequery") || lower.ends_with("\\query") || lower == "query")
+                && type_argument(p).is_none()
+        }) || !informative(&typed.name);
+        if loses_arg {
+            Typed {
+                name: query_ty,
+                annotated: typed.annotated || call.annotated,
+                exact: true,
+            }
+        } else {
+            typed
+        }
+    }
+
     /// `ActiveQuery<Model>::batch()` → `Model[][]`; `each()` → `Model[]` for foreach.
     fn query_batch_return(&self, member: &str, call: &Call, typed: Typed) -> Typed {
         let name = member.to_ascii_lowercase();
@@ -1960,16 +2861,19 @@ impl Scope<'_, '_> {
         else {
             return None;
         };
-        call.target.as_ref()?;
         let class = if *static_ {
             let Kind::Name(name) = &receiver.kind else {
                 return None;
             };
             self.resolve_class(name)
         } else {
+            // Instance refinements (relation getters) need a typed receiver.
             class_parts(&call.matched.name).into_iter().next()?
         };
         let (type_name, exact) = self.framework_return_of(&class, member)?;
+        // Apply even when the call target is unresolved: e.g. User::find() while the
+        // library parent that declares find() is outside declaration_paths — Yii still
+        // attached ActiveQuery<User> on the model class.
         Some(Typed {
             name: type_name,
             annotated: call.annotated,
@@ -2439,6 +3343,81 @@ fn sql_api(member: &str) -> bool {
     )
 }
 
+/// `ActiveQuery<Model>` / `Model|null` / `static::find()->…` → Model for attribute binding.
+fn model_from_query_context(ty: &str, receiver_expression: &str, enclosing_class: &str) -> String {
+    let from_ty = model_from_receiver(ty);
+    if is_model_class(&from_ty) {
+        return from_ty;
+    }
+    if let Some(from_expr) = class_before_find(receiver_expression) {
+        if from_expr.eq_ignore_ascii_case("static")
+            || from_expr.eq_ignore_ascii_case("self")
+            || from_expr.eq_ignore_ascii_case("parent")
+        {
+            if is_model_class(enclosing_class) {
+                return enclosing_class.to_owned();
+            }
+        } else if is_model_class(&from_expr) {
+            return from_expr;
+        }
+    }
+    if is_model_class(enclosing_class) {
+        return enclosing_class.to_owned();
+    }
+    from_ty
+}
+
+fn is_model_class(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    !name.is_empty()
+        && !lower.contains("activequery")
+        && !lower.ends_with("\\query")
+        && lower != "query"
+        && !matches!(
+            lower.as_str(),
+            "null" | "false" | "true" | "mixed" | "unknown" | "array"
+        )
+}
+
+fn class_before_find(expr: &str) -> Option<String> {
+    let lower = expr.to_ascii_lowercase();
+    let idx = lower.find("::find")?;
+    let before = expr[..idx].trim();
+    // take last namespace/class token
+    let name = before
+        .rsplit(|c: char| c == '(' || c == '>' || c == '=' || c == ',' || c.is_whitespace())
+        .next()?
+        .trim()
+        .trim_start_matches('\\');
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// `ActiveQuery<Model>` / `Model|null` → Model for attribute binding.
+fn model_from_receiver(ty: &str) -> String {
+    for part in class_parts(ty) {
+        if let Some(inner) = part
+            .split_once('<')
+            .and_then(|(_, rest)| rest.strip_suffix('>'))
+        {
+            let model = erase(inner.split('|').next().unwrap_or(inner).trim());
+            if !model.is_empty() && model != "array" {
+                return model.to_owned();
+            }
+        }
+    }
+    class_parts(ty)
+        .into_iter()
+        .map(|p| erase(&p).to_owned())
+        .find(|p| is_model_class(p))
+        .unwrap_or_else(|| {
+            erase(ty.split('|').next().unwrap_or(ty).trim())
+                .split('<')
+                .next()
+                .unwrap_or("")
+                .to_owned()
+        })
+}
+
 fn identifier_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars
@@ -2533,4 +3512,35 @@ impl Substitution {
             _ => part.to_owned(),
         }
     }
+}
+
+/// Cap stored expression text so occurrence metadata does not retain whole statements.
+fn clip_expr(text: String) -> String {
+    clip_text(text, 160)
+}
+
+/// Early-exit guards stored per function (`metadata.guards`).
+const GUARDS_PER_FUNCTION: usize = 16;
+/// Stored width of one guard condition.
+const GUARD_CONDITION_MAX: usize = 120;
+
+/// Stored width of one argument value; names are never clipped, only values.
+const ARG_VALUE_MAX: usize = 32;
+
+fn clip_text(text: String, max: usize) -> String {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// PHP 8 named argument label (`bonusType: $x`); the expression parser drops it.
+fn argument_label(unit: &Unit, arg: &Expr) -> Option<String> {
+    let label = arg.start.checked_sub(2)?;
+    (unit.tokens[label].kind == TokenKind::Ident && unit.is(arg.start - 1, ":"))
+        .then(|| unit.tokens[label].text.clone())
 }

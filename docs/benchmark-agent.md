@@ -48,3 +48,20 @@ Grep/Glob tools. The token metric of that run is not the same as the columns abo
 
 One run per agent and spec; answers differ in wording, so quality was spot-checked, not scored.
 Costs depend on the model and cache behaviour of the day.
+
+## Cycle-2 product gate (after R1–R7)
+
+Do **not** use openspec-spec parity cost as the KPI. Gate on graph-win tasks with
+pre-registered ground truth:
+
+- `bench/gold/maxwin.yaml` — MaxWin investigation (benchmark 3)
+- `bench/gold/daily_freespin.yaml` — DailyFreespin controller (benchmark 2)
+
+Rules:
+
+1. Freeze slotor commit + Atlas image digest before the run.
+2. Write / lock `must_find` **before** agents run (not from their answers).
+3. N≥5 per mode; primary metric = recall of `must_find` ids; cost/turns secondary.
+4. Deterministic graph checks (no LLM): `python3 scripts/check_golden_slotor.py`
+   (needs `ATLAS_AGENT_TOKEN`) and `cargo test --locked --test golden_facts`.
+5. Reject “fixed MaxWin” claims without a post-fix re-run against this gold.
