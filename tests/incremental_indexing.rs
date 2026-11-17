@@ -242,3 +242,20 @@ fn edit_of_a_caller_publishes_edges_into_unchanged_files() {
         .count();
     assert_eq!(runs, 2);
 }
+
+#[test]
+fn unrelated_file_change_during_incremental_prepare_does_not_abort_publish() {
+    let mut p = Project::new(&[("app/A.php", A), ("app/B.php", B), ("app/Other.php", OTHER)]);
+    write(
+        p.dir.path(),
+        "app/B.php",
+        &B.replace("$a->run();", "$a->run(); $a->run();"),
+    );
+    let prepared = p.coordinator.prepare_changes().unwrap();
+    // Touch a file outside the incremental scope while analysis is already done.
+    write(p.dir.path(), "app/Other.php", &OTHER.replace("return 0;", "return 9;"));
+    p.coordinator
+        .publish(&mut p.service, prepared)
+        .expect("edit outside scope must not fail publish");
+    assert_eq!(p.scope(), ["app/B.php"]);
+}

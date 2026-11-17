@@ -51,6 +51,8 @@ Indexing memory (2026-11-17): `ATLAS_MEMORY_LIMIT_MB` was Docker-only; process R
 
 Restart baseline (2026-11-17): discovery stores `path → MD5` in `atlas_source_files`; publish writes the map with the graph. On serve start the watcher `restore_from` + `Debouncer::seed` so an unchanged tree does not reanalyze; `index_changes` no-ops via `touch_source_baseline`. Evidence: `restart_skips_unchanged_files_by_path_md5`.
 
+Publish stability (2026-11-17): Yii `provides` used view-path `$var` nodes while incremental scope kept only the controller → retain dropped variables and aborted with `unknown node`. View-path nodes are emitted only when the view is in publish scope; dangling endpoints become `dangling_edge` diagnostics instead of failing the transaction. Incremental `source changed during analysis` checks only scoped paths. Evidence: `controller_body_edit_keeps_provides_without_republishing_view_nodes`, `unrelated_file_change_during_incremental_prepare_does_not_abort_publish`.
+
 ## Analysis boundaries
 
 This is a bounded, dependency-free structural parser and flow analyzer, not a full PHP compiler or a replacement for PHP's grammar validator. Balanced delimiters and known malformed declarations/expressions are rejected. Unrecognized expression semantics remain unknown with `analysis_limitation`; explicitly unsupported syntax prevents replacement of that file's existing graph. Acceptance is not proof that PHP would compile the file.

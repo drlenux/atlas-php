@@ -299,9 +299,7 @@ impl IndexCoordinator {
         let scope = context.and_then(|context| context.scope());
         if let Some(scope) = &scope {
             // Unchanged files keep their published facts; publish only the scope.
-            snapshot.nodes.retain(|n| scope.contains(&n.span.path));
-            snapshot.edges.retain(|e| scope.contains(&e.span.path));
-            snapshot.diagnostics.retain(|d| scope.contains(&d.path));
+            retain_snapshot_paths(&mut snapshot, |path| scope.contains(path));
         }
         let failed: BTreeSet<_> = snapshot
             .diagnostics
@@ -322,8 +320,7 @@ impl IndexCoordinator {
         // Nodes from a failed file must not remain: apply_snapshot requires every
         // node path to be in indexed_paths (successful scope).
         if !failed.is_empty() {
-            snapshot.nodes.retain(|n| !failed.contains(&n.span.path));
-            snapshot.edges.retain(|e| !failed.contains(&e.span.path));
+            retain_snapshot_paths(&mut snapshot, |path| !failed.contains(path));
         }
         let indexed_paths: Vec<_> = files
             .into_iter()
@@ -332,7 +329,9 @@ impl IndexCoordinator {
             .collect();
         self.progress
             .phase("validation", "after_analysis", None, "files");
-        if discover(&self.config)?.files != before.files {
+        // Incremental: only scoped paths must stay stable. An edit outside the
+        // publish set must not discard a finished analysis of the changed files.
+        if !sources_stable(&before.files, &discover(&self.config)?.files, scope.as_ref()) {
             return Err("source changed during analysis; snapshot not published".into());
         }
         // Prefer plugin chunk spill (occurrences already on disk). Append remaining
@@ -417,7 +416,11 @@ impl IndexCoordinator {
     ) -> Result<IndexReport, String> {
         self.progress
             .phase("validation", "before_commit", None, "files");
-        if discover(&self.config)?.files != prepared.observed {
+        if !sources_stable(
+            &prepared.observed,
+            &discover(&self.config)?.files,
+            prepared.scope.as_ref(),
+        ) {
             return Err("source changed before commit; snapshot not published".into());
         }
         self.progress
@@ -454,6 +457,34 @@ impl IndexCoordinator {
                 )
                 .map_err(|e| e.to_string())
         }
+    }
+}
+
+/// Keep facts whose path passes `keep`, and drop edges that pointed at nodes we
+/// just discarded (cross-path inject such as Yii `provides` → view `$var`).
+fn retain_snapshot_paths(snapshot: &mut GraphSnapshot, keep: impl Fn(&str) -> bool) {
+    let produced: BTreeSet<String> = snapshot.nodes.iter().map(|n| n.id.clone()).collect();
+    snapshot.diagnostics.retain(|d| keep(&d.path));
+    snapshot.edges.retain(|e| keep(&e.span.path));
+    snapshot.nodes.retain(|n| keep(&n.span.path));
+    let kept: BTreeSet<String> = snapshot.nodes.iter().map(|n| n.id.clone()).collect();
+    snapshot.edges.retain(|edge| {
+        let endpoint_ok = |id: &str| kept.contains(id) || !produced.contains(id);
+        endpoint_ok(&edge.from) && edge.to.as_ref().is_none_or(|to| endpoint_ok(to))
+    });
+}
+
+/// `scope == None` → full tree must match; otherwise only scoped paths.
+fn sources_stable(
+    before: &FileHashes,
+    after: &FileHashes,
+    scope: Option<&BTreeSet<String>>,
+) -> bool {
+    match scope {
+        None => before == after,
+        Some(scope) => scope
+            .iter()
+            .all(|path| before.get(path) == after.get(path)),
     }
 }
 

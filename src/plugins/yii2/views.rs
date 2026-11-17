@@ -95,43 +95,59 @@ pub(super) fn enrich_views(
         // Token-scan facts use `from: view:{path}`; ensure that source node exists
         // even when no controller `render` created it yet (nested-only views).
         if let Some(source_path) = fact.from.strip_prefix("view:") {
-            ensure_view_node(graph, source_path);
-            if let Some(controller) = &fact.controller {
-                ensure_view_owned(graph, fact, source_path, controller);
+            if can_publish_view_path(options, source_path) {
+                ensure_view_node(graph, source_path);
+                if let Some(controller) = &fact.controller {
+                    ensure_view_owned(graph, fact, source_path, controller);
+                }
             }
         }
         for view_path in &fact.candidates {
             let view_id = format!("view:{view_path}");
-            ensure_view_node(graph, view_path);
-            if let Some(controller) = &fact.controller {
-                ensure_view_owned(graph, fact, view_path, controller);
+            // View-path nodes (view/variable/contains) must only be emitted when that
+            // path is in the incremental publish scope — otherwise retain drops them
+            // and leaves controller-path `provides`/`renders` edges dangling.
+            let publish_view = can_publish_view_path(options, view_path);
+            if publish_view {
+                ensure_view_node(graph, view_path);
+                if let Some(controller) = &fact.controller {
+                    ensure_view_owned(graph, fact, view_path, controller);
+                }
             }
             let edge_id = format!("edge:renders:{}:{view_id}:{}", fact.call_id, fact.line);
-            if graph.edges.iter().any(|e| e.id == edge_id) {
-                continue;
+            if !graph.edges.iter().any(|e| e.id == edge_id) {
+                graph.edges.push(Edge {
+                    id: edge_id,
+                    kind: "renders".into(),
+                    from: fact.from.clone(),
+                    to: Some(view_id.clone()),
+                    span: SourceSpan {
+                        path: fact.path.clone(),
+                        start_line: fact.line,
+                        end_line: fact.line,
+                    },
+                    metadata: json!({
+                        "framework": "yii2",
+                        "framework_evidence": "render",
+                        "method": fact.method,
+                        "view": fact.view_name,
+                        "params": fact.params.iter().map(Value::from).collect::<Vec<_>>(),
+                        "resolution": if fact.candidates.len() == 1 { "resolved" } else { "candidate" },
+                    }),
+                    trust: 1,
+                    revision: 0,
+                });
             }
-            graph.edges.push(Edge {
-                id: edge_id,
-                kind: "renders".into(),
-                from: fact.from.clone(),
-                to: Some(view_id.clone()),
-                span: SourceSpan {
-                    path: fact.path.clone(),
-                    start_line: fact.line,
-                    end_line: fact.line,
-                },
-                metadata: json!({
-                    "framework": "yii2",
-                    "framework_evidence": "render",
-                    "method": fact.method,
-                    "view": fact.view_name,
-                    "params": fact.params.iter().map(Value::from).collect::<Vec<_>>(),
-                    "resolution": if fact.candidates.len() == 1 { "resolved" } else { "candidate" },
-                }),
-                trust: 1,
-                revision: 0,
-            });
-            inject_view_params(graph, view_path, &view_id, &fact.params, fact);
+            // Always emit provides (controller path). Create view-path variables only
+            // when the view is in publish scope — otherwise DB must already hold them.
+            inject_view_params(
+                graph,
+                view_path,
+                &view_id,
+                &fact.params,
+                fact,
+                publish_view,
+            );
         }
     }
     // `$this->layout = 'main'` / writes to layout → layouts/<name>.php owned by controller.
@@ -883,6 +899,17 @@ fn normalize_path(path: &str) -> String {
     parts.join("/")
 }
 
+/// Whether view-path facts may be added to this snapshot (full build or path in scope).
+fn can_publish_view_path(options: &AnalysisOptions, view_path: &str) -> bool {
+    let Some(incremental) = &options.incremental else {
+        return true;
+    };
+    match incremental.scope() {
+        None => true,
+        Some(paths) => paths.contains(view_path),
+    }
+}
+
 /// Params become typed view variables + annotate matching read_sites in the view file.
 fn inject_view_params(
     graph: &mut GraphSnapshot,
@@ -890,10 +917,11 @@ fn inject_view_params(
     view_id: &str,
     params: &[Param],
     fact: &RenderFact,
+    publish_view_nodes: bool,
 ) {
     for param in params {
         let var_id = format!("variable:{view_id}:${}", param.name);
-        if !graph.nodes.iter().any(|n| n.id == var_id) {
+        if publish_view_nodes && !graph.nodes.iter().any(|n| n.id == var_id) {
             graph.nodes.push(Node {
                 id: var_id.clone(),
                 kind: "variable".into(),
@@ -950,6 +978,9 @@ fn inject_view_params(
                 trust: 1,
                 revision: 0,
             });
+        }
+        if !publish_view_nodes {
+            continue;
         }
         // Annotate existing occurrence sites in the view that mention $name.
         for edge in graph.edges.iter_mut() {

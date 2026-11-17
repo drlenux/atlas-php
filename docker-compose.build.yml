@@ -3,7 +3,7 @@
 # ATLAS_IMAGE=… docker compose -f docker-compose.build.yml push atlas
 services:
   atlas:
-    image: ${ATLAS_IMAGE:-drlenux/memory-tools:0.3.8}
+    image: ${ATLAS_IMAGE:-drlenux/memory-tools:0.3.9}
     build:
       context: .
       dockerfile: Dockerfile

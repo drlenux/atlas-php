@@ -2582,7 +2582,7 @@ const WRITE_CHUNK: usize = 400;
 fn apply_spilled_snapshot(
     r: &mut dyn Repository,
     dir: &Path,
-    diagnostics: Vec<Diagnostic>,
+    mut diagnostics: Vec<Diagnostic>,
     indexed_paths: Vec<String>,
     removed_paths: Vec<String>,
     progress: &IndexingProgress,
@@ -2680,10 +2680,18 @@ fn apply_spilled_snapshot(
             .chain(edge.to.iter())
             .find(|id| !available.contains(*id))
         {
-            return Err(AtlasError::invalid(format!(
-                "snapshot edge {} refers to an unknown node {unknown}",
-                edge.id
-            )));
+            // Cross-path framework edges (e.g. provides → view $var) can outlive a
+            // discarded view-path node; skip instead of aborting the whole publish.
+            diagnostics.push(Diagnostic {
+                path: edge.span.path.clone(),
+                line: edge.span.start_line,
+                code: "dangling_edge".into(),
+                message: format!(
+                    "snapshot edge {} refers to an unknown node {unknown}; skipped",
+                    edge.id
+                ),
+            });
+            continue;
         }
         edge.trust = 1;
         edge.revision = 1;
@@ -3081,10 +3089,16 @@ fn apply_snapshot(
             .chain(edge.to.iter())
             .find(|id| !available_nodes.contains(*id))
         {
-            return Err(AtlasError::invalid(format!(
-                "snapshot edge {} refers to an unknown node {unknown}",
-                edge.id
-            )));
+            snapshot.diagnostics.push(Diagnostic {
+                path: edge.span.path.clone(),
+                line: edge.span.start_line,
+                code: "dangling_edge".into(),
+                message: format!(
+                    "snapshot edge {} refers to an unknown node {unknown}; skipped",
+                    edge.id
+                ),
+            });
+            continue;
         }
         let path = edge.span.path.clone();
         incoming_edges.push(edge);

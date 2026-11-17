@@ -1,10 +1,13 @@
 //! Yii2 render() → view file + params injected into the view.
 use code_atlas::{
     analyzer::{AnalysisOptions, SourceFile},
+    config::Config,
     domain::GraphSnapshot,
+    indexer::IndexCoordinator,
     repository::MemoryRepository,
     service::AtlasService,
 };
+use std::{collections::BTreeMap, fs};
 
 fn analyze(files: &[(&str, &str)]) -> GraphSnapshot {
     let files: Vec<_> = files
@@ -546,5 +549,83 @@ echo $issetWager;
     assert!(
         !tree.children.is_empty(),
         "callers tree on a view must walk renders edges: {tree:?}"
+    );
+}
+
+#[test]
+fn controller_body_edit_keeps_provides_without_republishing_view_nodes() {
+    // Incremental publish of the controller must not invent view-path variable
+    // nodes (they would be dropped by scope retain and break provides).
+    let dir = tempfile::tempdir().unwrap();
+    let write = |path: &str, source: &str| {
+        let full = dir.path().join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, source).unwrap();
+    };
+    write("vendor/yiisoft/yii2/base/Controller.php", YII);
+    write(
+        "partner/controllers/MyBonusController.php",
+        r#"<?php
+namespace partner\controllers;
+use yii\base\Controller;
+use common\models\User;
+class MyBonusController extends Controller {
+  public function actionIndex(User $user) {
+    return $this->render('index', ['user' => $user, 'issetWager' => true]);
+  }
+}
+"#,
+    );
+    write(
+        "partner/views/my-bonus/index.php",
+        "<?php\n/** @var yii\\web\\View $this */\necho $user->id;\necho $issetWager;\n",
+    );
+    let cfg = Config::from_map(&BTreeMap::from([
+        (
+            "ATLAS_PROJECT_ROOT".into(),
+            dir.path().display().to_string(),
+        ),
+        ("ATLAS_DATABASE_URL".into(), "dbname=test".into()),
+        ("ATLAS_AGENT_TOKEN".into(), "agent".into()),
+        ("ATLAS_REVIEW_TOKEN".into(), "reviewer".into()),
+        ("ATLAS_FRAMEWORK_PLUGINS".into(), "[\"yii2\"]".into()),
+        (
+            "ATLAS_DECLARATION_PATHS".into(),
+            "[\"vendor/yiisoft\"]".into(),
+        ),
+    ]))
+    .unwrap();
+    let mut coordinator = IndexCoordinator::new(cfg);
+    let mut service = AtlasService::new(Box::new(MemoryRepository::new()));
+    coordinator.index(&mut service).unwrap();
+    let var = "variable:view:partner/views/my-bonus/index.php:$user";
+    assert!(service.context(var, 0, 1).is_ok());
+    write(
+        "partner/controllers/MyBonusController.php",
+        r#"<?php
+namespace partner\controllers;
+use yii\base\Controller;
+use common\models\User;
+class MyBonusController extends Controller {
+  public function actionIndex(User $user) {
+    // body-only edit: same render params
+    return $this->render('index', ['user' => $user, 'issetWager' => true]);
+  }
+}
+"#,
+    );
+    coordinator.index_changes(&mut service).unwrap();
+    let ctx = service
+        .context("method:partner\\controllers\\MyBonusController::actionIndex", 1, 50)
+        .unwrap();
+    assert!(
+        ctx.edges.iter().any(|e| {
+            e.kind == "provides" && e.to.as_deref() == Some(var)
+        }),
+        "provides must survive controller-only republish: {:?}",
+        ctx.edges
+            .iter()
+            .filter(|e| e.kind == "provides")
+            .collect::<Vec<_>>()
     );
 }

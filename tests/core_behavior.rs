@@ -817,20 +817,37 @@ fn partial_publication_accepts_edges_to_stored_nodes_of_other_paths() {
         to: Some("nowhere".into()),
         ..s.context("caller", 1, 10).unwrap().edges[0].clone()
     };
-    let error = s
-        .index(
-            GraphSnapshot {
-                nodes: vec![node("caller", "C", 1)],
-                edges: vec![missing],
-                diagnostics: vec![],
-                spill_dir: None,
+    s.index(
+        GraphSnapshot {
+            nodes: vec![node("caller", "C", 1)],
+            edges: vec![missing],
+            diagnostics: vec![],
+            spill_dir: None,
         },
-            vec!["src/Test.php".into()],
-            vec![],
-            &std::collections::BTreeMap::new(),
-        )
-        .unwrap_err();
-    assert!(error.message.contains("nowhere"), "{error:?}");
+        vec!["src/Test.php".into()],
+        vec![],
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    let diags = s
+        .context("caller", 1, 10)
+        .unwrap()
+        .diagnostics
+        .into_iter()
+        .filter(|d| d.code == "dangling_edge")
+        .collect::<Vec<_>>();
+    assert!(
+        diags.iter().any(|d| d.message.contains("nowhere")),
+        "{diags:?}"
+    );
+    assert!(
+        !s.context("caller", 1, 10)
+            .unwrap()
+            .edges
+            .iter()
+            .any(|e| e.id == "dangling"),
+        "dangling edge must not be stored"
+    );
 }
 
 #[test]
