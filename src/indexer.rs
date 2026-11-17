@@ -7,12 +7,13 @@ use crate::{
     diagnostics_log,
     domain::{Diagnostic, GraphSnapshot, IndexReport},
     logging::AtlasLog,
+    memory_budget::{self, MemoryBudget},
     progress::IndexingProgress,
-    project::discover,
+    project::{discover, FileHashes},
     service::AtlasService,
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     io::{BufWriter, Read, Write},
     path::PathBuf,
@@ -30,7 +31,7 @@ pub struct IndexCoordinator {
     last_scope: Option<BTreeSet<String>>,
 }
 struct Published {
-    files: BTreeMap<String, u64>,
+    files: FileHashes,
     surface: Surface,
 }
 pub struct PreparedIndex {
@@ -38,7 +39,7 @@ pub struct PreparedIndex {
     /// When set, nodes/edges were spilled to disk so publish does not keep a second peak.
     spill_dir: Option<PathBuf>,
     indexed_paths: Vec<String>,
-    observed: BTreeMap<String, u64>,
+    observed: FileHashes,
     surface: Surface,
     /// `Some` for an incremental build: the only paths it publishes.
     scope: Option<BTreeSet<String>>,
@@ -77,24 +78,38 @@ impl IndexCoordinator {
     pub fn index(&mut self, service: &mut AtlasService) -> Result<IndexReport, String> {
         self.progress = service.indexing_progress();
         let prepared = self.prepare()?;
-        trim_allocator();
+        memory_budget::trim_allocator();
         self.publish(service, prepared)
     }
     /// Rebuild of changed files and their dependents; full when there is no baseline.
     pub fn index_changes(&mut self, service: &mut AtlasService) -> Result<IndexReport, String> {
         self.progress = service.indexing_progress();
         let prepared = self.prepare_changes()?;
-        trim_allocator();
+        memory_budget::trim_allocator();
         self.publish(service, prepared)
     }
     /// File hashes of the last successful publication.
-    pub fn published_files(&self) -> Option<&BTreeMap<String, u64>> {
+    pub fn published_files(&self) -> Option<&FileHashes> {
         self.published.as_ref().map(|published| &published.files)
     }
     /// Paths of the last publication when it was incremental; `None` after a full one.
     pub fn last_scope(&self) -> Option<&BTreeSet<String>> {
         self.last_scope.as_ref()
     }
+
+    /// Reload `path → MD5` (+ declaration surface) from the DB after a process restart.
+    pub fn restore_from(&mut self, service: &mut AtlasService) -> Result<bool, String> {
+        let files = service.source_files().map_err(|e| e.to_string())?;
+        if files.is_empty() {
+            self.published = None;
+            return Ok(false);
+        }
+        let nodes = service.declaration_nodes().map_err(|e| e.to_string())?;
+        let surface = declaration_surface(&nodes);
+        self.published = Some(Published { files, surface });
+        Ok(true)
+    }
+
     pub fn prepare(&self) -> Result<PreparedIndex, String> {
         self.prepare_with(false)
     }
@@ -111,6 +126,21 @@ impl IndexCoordinator {
     }
     fn prepare_snapshot(&self, incremental: bool) -> Result<PreparedIndex, String> {
         let before = discover(&self.config)?;
+        // Unchanged tree after restore: skip analysis entirely.
+        if incremental {
+            if let Some(published) = &self.published {
+                if published.files == before.files {
+                    return Ok(PreparedIndex {
+                        snapshot: GraphSnapshot::default(),
+                        spill_dir: None,
+                        indexed_paths: Vec::new(),
+                        observed: before.files.clone(),
+                        surface: published.surface.clone(),
+                        scope: Some(BTreeSet::new()),
+                    });
+                }
+            }
+        }
         let context = self
             .published
             .as_ref()
@@ -149,6 +179,7 @@ impl IndexCoordinator {
             incremental: context.clone(),
             areas: self.config.areas.clone(),
             log: self.log.clone(),
+            memory: MemoryBudget::from_limit_mb(self.config.memory_limit_mb),
         };
         let mut diagnostics = Vec::new();
         let mut files = Vec::new();
@@ -222,7 +253,7 @@ impl IndexCoordinator {
                             }
                             Ok(SourceFile {
                                 path: path.clone(),
-                                source,
+                                source: source.into(),
                             })
                         }
                         Err(message) => Err(Diagnostic {
@@ -259,8 +290,10 @@ impl IndexCoordinator {
             &self.config.framework_plugins,
             &options,
         )?;
-        // Analysis copied what it needs; free source texts before publish peak.
+        // Shared Arc texts may still live in Units until PHP finalize; drop the
+        // indexer-owned Vec so only plugin-held Arcs remain, then ask glibc to trim.
         drop(sources);
+        memory_budget::trim_allocator();
         snapshot.diagnostics.extend(diagnostics);
         let surface = declaration_surface(&snapshot.nodes);
         let scope = context.and_then(|context| context.scope());
@@ -302,8 +335,23 @@ impl IndexCoordinator {
         if discover(&self.config)?.files != before.files {
             return Err("source changed during analysis; snapshot not published".into());
         }
-        // Large graphs: spill nodes/edges before publish so RSS can fall after analysis.
-        let spill_dir = if snapshot.nodes.len() >= SPILL_NODE_THRESHOLD {
+        // Prefer plugin chunk spill (occurrences already on disk). Append remaining
+        // declaration/enrichment rows and publish from disk so RAM stays low.
+        let spill_dir = if let Some(dir) = snapshot.spill_dir.take() {
+            self.progress.phase(
+                "publishing",
+                "append_declarations_to_spill",
+                Some(snapshot.nodes.len()),
+                "items",
+            );
+            crate::graph_spill::append_snapshot(&dir, &snapshot.nodes, &snapshot.edges)?;
+            snapshot.nodes.clear();
+            snapshot.edges.clear();
+            snapshot.nodes.shrink_to_fit();
+            snapshot.edges.shrink_to_fit();
+            memory_budget::trim_allocator();
+            Some(dir)
+        } else if snapshot.nodes.len() >= options.memory.spill_node_threshold() {
             self.progress.phase(
                 "publishing",
                 "spill_snapshot",
@@ -314,7 +362,7 @@ impl IndexCoordinator {
         } else {
             None
         };
-        trim_allocator();
+        memory_budget::trim_allocator();
         Ok(PreparedIndex {
             snapshot,
             spill_dir,
@@ -335,9 +383,19 @@ impl IndexCoordinator {
         };
         let scope = prepared.scope.clone();
         let spill_dir = prepared.spill_dir.clone();
-        // Before commit: parse/unsupported/analysis gaps must be in docker logs / file.
-        diagnostics_log::log_diagnostics(&prepared.snapshot.diagnostics, &self.log);
-        let result = self.publish_snapshot(service, prepared);
+        // Unchanged tree: keep graph, refresh baseline hashes only.
+        let noop = prepared.indexed_paths.is_empty()
+            && prepared.scope.as_ref().is_some_and(|s| s.is_empty())
+            && prepared.snapshot.nodes.is_empty()
+            && prepared.spill_dir.is_none();
+        let result = if noop {
+            service
+                .touch_source_baseline(&baseline.files)
+                .map_err(|e| e.to_string())
+        } else {
+            diagnostics_log::log_diagnostics(&prepared.snapshot.diagnostics, &self.log);
+            self.publish_snapshot(service, prepared)
+        };
         if let Some(dir) = spill_dir {
             let _ = fs::remove_dir_all(dir);
         }
@@ -346,7 +404,7 @@ impl IndexCoordinator {
                 self.published = Some(baseline);
                 self.last_scope = scope;
                 self.progress.complete();
-                trim_allocator();
+                memory_budget::trim_allocator();
             }
             Err(error) => self.progress.fail(error),
         }
@@ -365,10 +423,17 @@ impl IndexCoordinator {
         self.progress
             .phase("publishing", "transaction", None, "items");
         let known_paths = service.source_paths().map_err(|e| e.to_string())?;
-        let removed_paths=known_paths.into_iter().filter(|path| {
-        // Only a filesystem NotFound confirms deletion; permission failures do not.
-        matches!(std::fs::symlink_metadata(self.config.project_root.join(path)),Err(error) if error.kind()==std::io::ErrorKind::NotFound)
-    }).collect();
+        let removed_paths = known_paths
+            .into_iter()
+            .filter(|path| {
+                // Only a filesystem NotFound confirms deletion; permission failures do not.
+                matches!(
+                    std::fs::symlink_metadata(self.config.project_root.join(path)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                )
+            })
+            .collect();
+        let hashes = &prepared.observed;
         if let Some(dir) = &prepared.spill_dir {
             service
                 .index_spilled(
@@ -376,19 +441,23 @@ impl IndexCoordinator {
                     prepared.snapshot.diagnostics,
                     prepared.indexed_paths,
                     removed_paths,
+                    hashes,
                 )
                 .map_err(|e| e.to_string())
         } else {
             service
-                .index(prepared.snapshot, prepared.indexed_paths, removed_paths)
+                .index(
+                    prepared.snapshot,
+                    prepared.indexed_paths,
+                    removed_paths,
+                    hashes,
+                )
                 .map_err(|e| e.to_string())
         }
     }
 }
 
 /// Spill graphs this large so publish does not keep analysis peak + write buffers.
-const SPILL_NODE_THRESHOLD: usize = 50_000;
-
 fn spill_snapshot(snapshot: &mut GraphSnapshot) -> Result<PathBuf, String> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -419,15 +488,4 @@ fn spill_snapshot(snapshot: &mut GraphSnapshot) -> Result<PathBuf, String> {
     snapshot.nodes.shrink_to_fit();
     snapshot.edges.shrink_to_fit();
     Ok(dir)
-}
-
-/// Ask glibc to return free arenas to the OS after a full-index peak.
-fn trim_allocator() {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        extern "C" {
-            fn malloc_trim(pad: usize) -> i32;
-        }
-        let _ = malloc_trim(0);
-    }
 }

@@ -81,9 +81,11 @@ fn postgres_cross_connection_revisions_review_and_analytics_round_trip() {
                 nodes: vec![node(&id, &path)],
                 edges: vec![],
                 diagnostics: vec![],
-            },
+                spill_dir: None,
+        },
             vec![path.clone()],
             vec![],
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
     let revision = second.context(&id, 0, 10).unwrap().nodes[0].revision;
@@ -142,7 +144,7 @@ fn postgres_cross_connection_revisions_review_and_analytics_round_trip() {
     assert_eq!(analytics.total_responses, 1);
     assert_eq!(analytics.elements.len(), 1);
     first
-        .index(GraphSnapshot::default(), vec![], vec![path.clone()])
+        .index(GraphSnapshot::default(), vec![], vec![path.clone()], &std::collections::BTreeMap::new())
         .unwrap();
     assert!(second.context(&id, 0, 10).is_err());
     let analytics = second.analytics(timestamp, timestamp + 1, 86400).unwrap();

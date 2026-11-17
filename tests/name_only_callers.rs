@@ -103,6 +103,7 @@ fn service() -> AtlasService {
             nodes,
             edges,
             diagnostics: vec![],
+            spill_dir: None,
         },
         vec![
             "src/A.php".into(),
@@ -110,6 +111,7 @@ fn service() -> AtlasService {
             "src/P.php".into(),
         ],
         vec![],
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     s

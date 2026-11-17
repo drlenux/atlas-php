@@ -194,6 +194,39 @@ fn manual_reindex_is_a_full_rebuild() {
 }
 
 #[test]
+fn restart_skips_unchanged_files_by_path_md5() {
+    let mut p = Project::new(&[("app/A.php", A), ("app/B.php", B), ("app/Other.php", OTHER)]);
+    let hashes = p.service.source_files().unwrap();
+    assert!(hashes.contains_key("app/A.php") && hashes.contains_key("app/B.php"));
+    let before = p.node("method:app\\Other::idle").unwrap().revision;
+
+    // New process: restore path→MD5 baseline from the repository, then incremental pass.
+    let mut restarted = IndexCoordinator::new(config(p.dir.path()));
+    assert!(restarted.restore_from(&mut p.service).unwrap());
+    let report = restarted.index_changes(&mut p.service).unwrap();
+    assert_eq!(report.nodes, 0);
+    assert_eq!(report.edges, 0);
+    assert_eq!(restarted.last_scope().map(|s| s.len()), Some(0));
+    assert_eq!(
+        p.node("method:app\\Other::idle").unwrap().revision,
+        before,
+        "unchanged graph must not be rewritten on restart"
+    );
+
+    write(p.dir.path(), "app/A.php", &A.replace("return 1;", "return 2;"));
+    restarted.index_changes(&mut p.service).unwrap();
+    assert_eq!(
+        restarted
+            .last_scope()
+            .expect("incremental after edit")
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["app/A.php"]
+    );
+}
+
+#[test]
 fn edit_of_a_caller_publishes_edges_into_unchanged_files() {
     let mut p = Project::new(&[("app/A.php", A), ("app/B.php", B), ("app/Other.php", OTHER)]);
     p.change(

@@ -88,7 +88,8 @@ fn inherited_getters_and_setters_resolve_only_for_yii_classes() {
             ),
         ],
         diagnostics: vec![],
-    };
+        spill_dir: None,
+        };
     enrich(&mut graph, &[]);
     assert_eq!(graph.edges[0].kind, "calls");
     assert_eq!(
@@ -132,7 +133,8 @@ fn static_behaviors_resolve_aliases_and_do_not_apply_to_plain_php_classes() {
             ),
         ],
         diagnostics: vec![],
-    };
+        spill_dir: None,
+        };
     enrich(&mut graph, &[]);
     assert_eq!(
         graph.edges[0].to.as_deref(),
@@ -158,7 +160,8 @@ fn component_calls_resolve_static_config_and_global_yii_only() {
         ],
         edges: vec![call, ordinary],
         diagnostics: vec![],
-    };
+        spill_dir: None,
+        };
     enrich(&mut graph, &files);
     assert_eq!(
         graph.edges[0].to.as_deref(),
@@ -193,7 +196,8 @@ fn conflicting_or_dynamic_component_definitions_remain_candidates() {
         ],
         edges: vec![call],
         diagnostics: vec![],
-    };
+        spill_dir: None,
+        };
     enrich(&mut graph, &files);
     assert!(graph.edges[0].to.is_none());
     assert_eq!(graph.edges[0].metadata["resolution"], "candidate");
@@ -245,7 +249,8 @@ fn conditional_behavior_and_dynamic_member_do_not_guess_targets() {
             ),
         ],
         diagnostics: vec![],
-    };
+        spill_dir: None,
+        };
     enrich(&mut graph, &[]);
     assert!(graph.edges.iter().all(|e| e.to.is_none()));
 }
@@ -285,7 +290,8 @@ fn dynamic_component_map_prevents_false_certainty_from_another_config() {
         ],
         edges: vec![call],
         diagnostics: vec![],
-    };
+        spill_dir: None,
+        };
     enrich(&mut graph, &files);
     assert!(
         graph.edges[0].to.is_none(),
@@ -313,7 +319,8 @@ fn runtime_spread_cannot_confirm_the_static_component_class() {
         ],
         edges: vec![call],
         diagnostics: vec![],
-    };
+        spill_dir: None,
+        };
     enrich(&mut graph, &files);
     assert!(
         graph.edges[0].to.is_none(),
@@ -342,7 +349,8 @@ fn return_inside_a_closure_does_not_register_a_behavior() {
             "call",
         )],
         diagnostics: vec![],
-    };
+        spill_dir: None,
+        };
     enrich(&mut graph, &[]);
     assert!(
         graph.edges[0].to.is_none(),
@@ -470,7 +478,8 @@ fn component_calls_missing_everywhere_including_behaviors_are_undeclared() {
             code: "unresolved_call".into(),
             message: "Cannot resolve call $m->gone()".into(),
         }],
-    };
+        spill_dir: None,
+        };
     enrich(&mut graph, &[]);
     let edge = |id: &str| graph.edges.iter().find(|e| e.id == id).unwrap();
     assert_eq!(
@@ -531,7 +540,8 @@ fn undeclared_needs_every_possible_declarer_to_be_ruled_out() {
             call("with", "App\\Query", "with"),
         ],
         diagnostics: vec![],
-    };
+        spill_dir: None,
+        };
     enrich(&mut graph, &[]);
     for edge in &graph.edges {
         assert_ne!(edge.metadata["undeclared"], true, "{}", edge.id);

@@ -74,6 +74,7 @@ impl LanguagePlugin for PgsqlLanguagePlugin {
             nodes: nodes.into_values().collect(),
             edges: edges.into_values().collect(),
             diagnostics,
+            spill_dir: None,
         })
     }
 }
@@ -221,6 +222,7 @@ pub fn embed_sql(
         nodes: nodes.into_values().collect(),
         edges: edges.into_values().collect(),
         diagnostics: Vec::new(),
+        spill_dir: None,
     })
 }
 

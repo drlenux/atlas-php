@@ -1,7 +1,8 @@
 //! Language-neutral contracts for extensions compiled into Atlas.
-use crate::domain::GraphSnapshot;
+use crate::{domain::GraphSnapshot, memory_budget::MemoryBudget};
 use std::{
     collections::BTreeMap,
+    sync::Arc,
     time::{Duration, Instant},
 };
 pub mod incremental;
@@ -11,7 +12,8 @@ pub use registry::PluginRegistry;
 #[derive(Clone, Debug)]
 pub struct SourceFile {
     pub path: String,
-    pub source: String,
+    /// Shared across registry/plugin/Unit clones — indexing must not triple-buffer text.
+    pub source: Arc<str>,
 }
 
 #[derive(Clone, Debug)]
@@ -29,6 +31,8 @@ pub struct AnalysisOptions {
     pub areas: Vec<crate::domain::Area>,
     /// Optional project file log (parse errors/skips).
     pub log: crate::logging::AtlasLog,
+    /// In-process RSS/cgroup budget (`ATLAS_MEMORY_LIMIT_MB`); `0` disables.
+    pub memory: MemoryBudget,
 }
 
 /// Context of an incremental rebuild. A language plugin that supports it analyzes
@@ -93,6 +97,7 @@ impl Default for AnalysisOptions {
             incremental: None,
             areas: Vec::new(),
             log: crate::logging::AtlasLog::default(),
+            memory: MemoryBudget::default(),
         }
     }
 }
@@ -111,6 +116,7 @@ impl AnalysisOptions {
         if elements > self.max_graph_elements {
             return Err("analysis graph element limit exceeded".into());
         }
+        // Memory pressure never aborts: plugins/indexer shrink batches and workers.
         Ok(())
     }
 }

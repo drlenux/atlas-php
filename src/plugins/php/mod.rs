@@ -96,7 +96,7 @@ fn analyze_files(
                 for function in declarations.functions.values_mut() {
                     function.unit = unit_index;
                 }
-                project.units.push(unit);
+                project.units.push(std::sync::Arc::new(unit));
                 project.classes.extend(declarations.classes);
                 project.functions.extend(declarations.functions);
                 project.closures.extend(
@@ -121,6 +121,7 @@ fn analyze_files(
             nodes: project.nodes.values().cloned().collect(),
             edges: project.edges.values().cloned().collect(),
             diagnostics: Vec::new(),
+            spill_dir: None,
         };
         project.merge_members(source.members(&declarations)?)?;
     }
@@ -161,16 +162,23 @@ fn analyze_files(
         Some(functions.len().saturating_mul(2)),
         "functions",
     );
-    let workers = options.workers.min(functions.len().max(1)).max(1);
+    let mut workers = options.workers.min(functions.len().max(1)).max(1);
     options
         .progress
         .set_workers(workers.min(functions.len().max(1)));
     let base_nodes = std::mem::take(&mut project.nodes);
     let base_edges = std::mem::take(&mut project.edges);
     let relation_edge_count = base_edges.len();
-    // Pass 1: collect body returns in batches. Drop each batch before the next so
-    // peak RSS is not ~N function graphs at once (2 GiB containers OOM on Slotor).
-    for chunk in functions.chunks(FLOW_BATCH) {
+    // Pass 1: body returns in pressure-sized batches (never abort on memory).
+    let mut offset = 0;
+    while offset < functions.len() {
+        workers = options.memory.throttle_workers(workers);
+        let batch = options.memory.flow_batch().max(1);
+        let end = (offset + batch).min(functions.len());
+        let chunk = &functions[offset..end];
+        options
+            .progress
+            .set_workers(workers.min(chunk.len().max(1)));
         let pass1 = run_flow_pass(
             chunk,
             &base_nodes,
@@ -179,8 +187,8 @@ fn analyze_files(
             options,
             workers,
         )?;
-        for (offset, outcome) in pass1.into_iter().enumerate() {
-            let function = &chunk[offset];
+        for (i, outcome) in pass1.into_iter().enumerate() {
+            let function = &chunk[i];
             if let Ok((nodes, _, _)) = outcome {
                 if let Some(inferred) = inferred_return(function, nodes.get(&function.id)) {
                     if let Some(f) = project.functions.get_mut(&function.id) {
@@ -189,11 +197,26 @@ fn analyze_files(
                 }
             }
         }
+        if options.memory.should_trim() {
+            crate::memory_budget::trim_allocator();
+        }
+        offset = end;
     }
-    // Pass 2: merge occurrence graphs batch-by-batch; base stays declaration-only.
+    crate::memory_budget::trim_allocator();
+    // Pass 2: occurrence graphs. Under pressure, finished chunks go to disk so the
+    // next batch can run without holding the whole occurrence graph in RAM.
     let mut occurrence_nodes = BTreeMap::new();
     let mut occurrence_edges = BTreeMap::new();
-    for chunk in functions.chunks(FLOW_BATCH) {
+    let mut occurrence_spill: Option<crate::graph_spill::GraphSpill> = None;
+    offset = 0;
+    while offset < functions.len() {
+        workers = options.memory.throttle_workers(workers);
+        let batch = options.memory.flow_batch().max(1);
+        let end = (offset + batch).min(functions.len());
+        let chunk = &functions[offset..end];
+        options
+            .progress
+            .set_workers(workers.min(chunk.len().max(1)));
         let pass2 = run_flow_pass(
             chunk,
             &base_nodes,
@@ -202,8 +225,8 @@ fn analyze_files(
             options,
             workers,
         )?;
-        for (offset, outcome) in pass2.into_iter().enumerate() {
-            let function = &chunk[offset];
+        for (i, outcome) in pass2.into_iter().enumerate() {
+            let function = &chunk[i];
             match outcome {
                 Ok((nodes, edges, diagnostics)) => {
                     occurrence_nodes.extend(nodes);
@@ -224,17 +247,44 @@ fn analyze_files(
                 }
             }
         }
+        if occurrence_nodes.len() >= options.memory.occurrence_flush_at() {
+            flush_occurrences(
+                &mut occurrence_spill,
+                &mut occurrence_nodes,
+                &mut occurrence_edges,
+            )?;
+            crate::memory_budget::trim_allocator();
+        } else if options.memory.should_trim() {
+            crate::memory_budget::trim_allocator();
+        }
+        offset = end;
     }
     drop(functions);
+    // Declarations stay in RAM for Yii enrich / origins; occurrences may already
+    // be on disk — flush any remainder before building the snapshot.
+    if !occurrence_nodes.is_empty() || !occurrence_edges.is_empty() {
+        if occurrence_spill.is_some() {
+            flush_occurrences(
+                &mut occurrence_spill,
+                &mut occurrence_nodes,
+                &mut occurrence_edges,
+            )?;
+        } else {
+            // Small enough: keep occurrences in the in-memory snapshot.
+        }
+    }
     project.nodes = base_nodes;
     project.edges = base_edges;
-    project.nodes.extend(occurrence_nodes);
-    project.edges.extend(occurrence_edges);
+    if occurrence_spill.is_none() {
+        project.nodes.extend(occurrence_nodes);
+        project.edges.extend(occurrence_edges);
+    }
     options
         .progress
         .phase("analysis", "php_finalize", None, "items");
     // Parse corpus is unused for origins; free it before definition materialization.
     project.units = Vec::new();
+    crate::memory_budget::trim_allocator();
     project.classes = BTreeMap::new();
     project.functions = BTreeMap::new();
     project.closures = BTreeMap::new();
@@ -245,13 +295,46 @@ fn analyze_files(
         nodes: project.nodes.into_values().collect(),
         edges: project.edges.into_values().collect(),
         diagnostics: project.diagnostics,
+        spill_dir: None,
     };
-    crate::analyzer::sync_occurrence_resolution(&mut graph);
+    if let Some(spill) = occurrence_spill {
+        graph.spill_dir = Some(spill.finish()?);
+    } else {
+        crate::analyzer::sync_occurrence_resolution(&mut graph);
+    }
     Ok(graph)
 }
 
-/// Max concurrent function-body graphs held during a flow pass.
-const FLOW_BATCH: usize = 512;
+fn flush_occurrences(
+    spill: &mut Option<crate::graph_spill::GraphSpill>,
+    nodes: &mut BTreeMap<String, crate::domain::Node>,
+    edges: &mut BTreeMap<String, crate::domain::Edge>,
+) -> Result<(), String> {
+    if nodes.is_empty() && edges.is_empty() {
+        return Ok(());
+    }
+    // Sync resolution for this chunk before it leaves RAM.
+    let mut chunk = GraphSnapshot {
+        nodes: nodes.values().cloned().collect(),
+        edges: edges.values().cloned().collect(),
+        diagnostics: Vec::new(),
+        spill_dir: None,
+    };
+    crate::analyzer::sync_occurrence_resolution(&mut chunk);
+    let sink = match spill {
+        Some(s) => s,
+        None => {
+            *spill = Some(crate::graph_spill::GraphSpill::create()?);
+            spill.as_mut().unwrap()
+        }
+    };
+    sink.append_nodes(chunk.nodes)?;
+    sink.append_edges(chunk.edges)?;
+    sink.flush()?;
+    nodes.clear();
+    edges.clear();
+    Ok(())
+}
 type FlowDelta = (
     BTreeMap<String, Node>,
     BTreeMap<String, Edge>,
@@ -430,7 +513,8 @@ impl std::ops::Index<&String> for NodesMap<'_> {
 /// Per-function flow workspace: shared declaration graph is read-only; writes stay local.
 pub(super) struct FlowHost<'a> {
     pub(super) options: &'a AnalysisOptions,
-    pub(super) units: &'a [Unit],
+    /// Arc so parallel workers share tokens/source instead of cloning whole Units.
+    pub(super) units: &'a [std::sync::Arc<Unit>],
     pub(super) classes: &'a BTreeMap<String, Class>,
     pub(super) index: &'a ClassIndex,
     pub(super) functions: &'a BTreeMap<String, Function>,
@@ -521,7 +605,7 @@ impl FlowHost<'_> {
 
 pub(super) struct Project<'a> {
     options: &'a AnalysisOptions,
-    units: Vec<Unit>,
+    units: Vec<std::sync::Arc<Unit>>,
     classes: BTreeMap<String, Class>,
     index: ClassIndex,
     functions: BTreeMap<String, Function>,

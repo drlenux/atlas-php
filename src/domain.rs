@@ -122,6 +122,10 @@ pub struct GraphSnapshot {
     pub edges: Vec<Edge>,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
+    /// Occurrence (or full) graph chunks on disk — publish streams these so RAM
+    /// can stay near declaration size while analysis continues.
+    #[serde(skip)]
+    pub spill_dir: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

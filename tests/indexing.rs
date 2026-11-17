@@ -40,6 +40,7 @@ fn seeded() -> AtlasService {
             },
             vec!["a.php".into()],
             vec![],
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
     service

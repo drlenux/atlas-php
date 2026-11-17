@@ -50,7 +50,7 @@ fn service_for(source: &str) -> AtlasService {
         )
         .unwrap();
     let mut s = AtlasService::new(Box::new(MemoryRepository::new()));
-    s.index(snapshot, vec!["App.php".into()], vec![]).unwrap();
+    s.index(snapshot, vec!["App.php".into()], vec![], &std::collections::BTreeMap::new()).unwrap();
     s
 }
 

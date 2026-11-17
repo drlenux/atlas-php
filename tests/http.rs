@@ -88,7 +88,7 @@ fn service() -> Arc<Mutex<AtlasService>> {
         {"id":"b", "kind":"class", "name":"A", "qualified_name":"A", "span":{"path":"a.php","start_line":1,"end_line":5}}
     ], "edges":[{"id":"e","kind":"contains","from":"b","to":"a","span":{"path":"a.php","start_line":2,"end_line":4}}]})).unwrap();
     service
-        .index(snapshot, vec!["a.php".to_owned()], vec![])
+        .index(snapshot, vec!["a.php".to_owned()], vec![], &std::collections::BTreeMap::new())
         .unwrap();
     Arc::new(Mutex::new(service))
 }
@@ -545,7 +545,7 @@ fn lean_service() -> Arc<Mutex<AtlasService>> {
         {"id":"k1","kind":"calls","from":"call_site:caller:1","to":"method:pay","span":{"path":"w.php","start_line":11,"end_line":11}}
     ], "diagnostics":[{"path":"w.php","line":3,"code":"unresolved_call","message":"cannot resolve"}]})).unwrap();
     service
-        .index(snapshot, vec!["w.php".to_owned()], vec![])
+        .index(snapshot, vec!["w.php".to_owned()], vec![], &std::collections::BTreeMap::new())
         .unwrap();
     Arc::new(Mutex::new(service))
 }
@@ -1126,7 +1126,7 @@ fn owner_service() -> Arc<Mutex<AtlasService>> {
         {"id":"o2","kind":"contains","from":"class:Wallet","to":"method:refund","span":{"path":"w.php","start_line":6,"end_line":9}}
     ]})).unwrap();
     service
-        .index(snapshot, vec!["w.php".to_owned()], vec![])
+        .index(snapshot, vec!["w.php".to_owned()], vec![], &std::collections::BTreeMap::new())
         .unwrap();
     Arc::new(Mutex::new(service))
 }
@@ -1292,6 +1292,7 @@ fn tests_service() -> Arc<Mutex<AtlasService>> {
                 "common/tests/WalletTest.php".into(),
             ],
             vec![],
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
     Arc::new(Mutex::new(service))
@@ -1492,6 +1493,7 @@ fn areas_service() -> Arc<Mutex<AtlasService>> {
                 "admin/B.php".into(),
             ],
             vec![],
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
     Arc::new(Mutex::new(service))
@@ -1649,7 +1651,7 @@ fn panicking_service(armed: Arc<AtomicBool>) -> Arc<Mutex<AtlasService>> {
         {"id":"a", "kind":"method", "name":"pay", "qualified_name":"A::pay", "span":{"path":"a.php","start_line":2,"end_line":4}}
     ], "edges":[]})).unwrap();
     service
-        .index(snapshot, vec!["a.php".to_owned()], vec![])
+        .index(snapshot, vec!["a.php".to_owned()], vec![], &std::collections::BTreeMap::new())
         .unwrap();
     Arc::new(Mutex::new(service))
 }

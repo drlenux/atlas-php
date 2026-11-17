@@ -46,9 +46,11 @@ fn indexed(nodes: Vec<Node>, edges: Vec<Edge>, diagnostics: Vec<Diagnostic>) -> 
             nodes,
             edges,
             diagnostics,
+            spill_dir: None,
         },
         vec![PATH.into()],
         vec![],
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     s

@@ -44,9 +44,11 @@ fn publish(service: &mut AtlasService, edges: Vec<Edge>) -> IndexReport {
                 nodes: vec![node("caller"), node("callee")],
                 edges,
                 diagnostics: vec![],
-            },
+                spill_dir: None,
+        },
             vec!["app.php".into()],
             vec![],
+            &std::collections::BTreeMap::new(),
         )
         .unwrap()
 }
@@ -245,9 +247,11 @@ fn node_fingerprint_matching_scales_for_large_graphs() {
                 nodes: old_nodes,
                 edges: vec![],
                 diagnostics: vec![],
-            },
+                spill_dir: None,
+        },
             vec!["app.php".into()],
             vec![],
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
     let new_nodes: Vec<_> = (0..COUNT)
@@ -264,9 +268,11 @@ fn node_fingerprint_matching_scales_for_large_graphs() {
                 nodes: new_nodes,
                 edges: vec![],
                 diagnostics: vec![],
-            },
+                spill_dir: None,
+        },
             vec!["app.php".into()],
             vec![],
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
     assert!(
@@ -304,9 +310,11 @@ fn call_site_matching_respects_scope_kind_source_and_old_ambiguity() {
                     different_source,
                 ],
                 diagnostics: vec![],
-            },
+                spill_dir: None,
+        },
             vec!["app.php".into(), "other.php".into()],
             vec![],
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
     let report = publish(

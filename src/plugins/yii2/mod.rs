@@ -48,6 +48,7 @@ impl FrameworkPlugin for Yii2Plugin {
             nodes,
             edges: Vec::new(),
             diagnostics,
+            spill_dir: None,
         })
     }
     fn enrich(

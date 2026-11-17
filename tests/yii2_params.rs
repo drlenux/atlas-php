@@ -67,8 +67,13 @@ fn config_key_is_findable_via_symbol_search() {
         "<?php\nreturn [\n  'piastrixInvoiceRefund' => 'https://x',\n];\n",
     )]);
     let mut s = AtlasService::new(Box::new(MemoryRepository::new()));
-    s.index(g, vec!["common/config/params.php".into()], vec![])
-        .unwrap();
+    s.index(
+        g,
+        vec!["common/config/params.php".into()],
+        vec![],
+        &std::collections::BTreeMap::new(),
+    )
+    .unwrap();
     let page = s
         .search_page(
             &NodeSearch {

@@ -14,9 +14,11 @@ fn source_paths_are_complete_and_deduplicated_without_search_limit() {
             nodes: vec![other],
             edges: vec![],
             diagnostics: vec![],
+            spill_dir: None,
         },
         vec!["other/File.php".into()],
         vec![],
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert_eq!(
@@ -50,9 +52,11 @@ fn index(s: &mut AtlasService, nodes: Vec<Node>, edges: Vec<Edge>) {
             nodes,
             edges,
             diagnostics: vec![],
+            spill_dir: None,
         },
         vec!["src/Test.php".into()],
         vec![],
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
 }
@@ -259,9 +263,11 @@ fn failed_index_batch_rolls_back_earlier_objects() {
                 revision: 0,
             }],
             diagnostics: vec![],
+            spill_dir: None,
         },
         vec!["src/Test.php".into()],
         vec![],
+        &std::collections::BTreeMap::new(),
     );
     assert!(result.is_err());
     assert_eq!(current(&mut s, "a").span.start_line, 1);
@@ -712,9 +718,11 @@ fn repeated_diagnostics_for_unpublished_files_do_not_accumulate() {
             nodes: vec![broken],
             edges: vec![],
             diagnostics: vec![],
+            spill_dir: None,
         },
         vec!["src/Broken.php".into()],
         vec![],
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     let parse_error = Diagnostic {
@@ -730,9 +738,11 @@ fn repeated_diagnostics_for_unpublished_files_do_not_accumulate() {
                 nodes: vec![node("a", "A", 1)],
                 edges: vec![],
                 diagnostics: vec![parse_error.clone()],
-            },
+                spill_dir: None,
+        },
             vec!["src/Test.php".into()],
             vec![],
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
     }
@@ -777,9 +787,11 @@ fn partial_publication_accepts_edges_to_stored_nodes_of_other_paths() {
             nodes: vec![target],
             edges: vec![],
             diagnostics: vec![],
+            spill_dir: None,
         },
         vec!["src/Other.php".into()],
         vec![],
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     let caller = node("caller", "C", 1);
@@ -811,9 +823,11 @@ fn partial_publication_accepts_edges_to_stored_nodes_of_other_paths() {
                 nodes: vec![node("caller", "C", 1)],
                 edges: vec![missing],
                 diagnostics: vec![],
-            },
+                spill_dir: None,
+        },
             vec!["src/Test.php".into()],
             vec![],
+            &std::collections::BTreeMap::new(),
         )
         .unwrap_err();
     assert!(error.message.contains("nowhere"), "{error:?}");

@@ -43,9 +43,11 @@ fn indexed(nodes: Vec<Node>, edges: Vec<Edge>) -> AtlasService {
             nodes,
             edges,
             diagnostics: vec![],
+            spill_dir: None,
         },
         vec!["app/Model.php".into()],
         vec![],
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     s
@@ -474,7 +476,7 @@ fn freshness_reports_publication_time_and_pending_changes() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    s.index(GraphSnapshot::default(), vec![], vec![]).unwrap();
+    s.index(GraphSnapshot::default(), vec![], vec![], &std::collections::BTreeMap::new()).unwrap();
     let fresh = s.freshness().unwrap();
     assert!(fresh
         .indexed_at

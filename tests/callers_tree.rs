@@ -147,9 +147,11 @@ fn service() -> AtlasService {
             nodes,
             edges,
             diagnostics: vec![],
+            spill_dir: None,
         },
         paths.iter().map(|p| p.to_string()).collect(),
         vec![],
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     s
@@ -244,9 +246,11 @@ fn callers_carry_the_area_of_their_call_site() {
                 edge("calls", "call_site:Z::z:3", "method:A::a"),
             ],
             diagnostics: vec![],
+            spill_dir: None,
         },
         vec!["src/Z.php".into()],
         vec![],
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     let tree = s

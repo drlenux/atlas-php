@@ -77,9 +77,11 @@ fn bonus_index() -> AtlasService {
             nodes,
             edges: vec![],
             diagnostics: vec![],
+            spill_dir: None,
         },
         vec!["src/Bonus.php".into()],
         vec![],
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     s
@@ -145,9 +147,11 @@ fn exclude_paths_drops_matching_nodes() {
             nodes: vec![test_site],
             edges: vec![],
             diagnostics: vec![],
+            spill_dir: None,
         },
         vec!["common/tests/BonusTest.php".into()],
         vec![],
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     assert!(bonus_index_ids(&mut s, None).contains("call_site:test"));
@@ -220,9 +224,11 @@ fn class_method_ids(query: &str, mode: SearchMode) -> Vec<String> {
             nodes: class_method_nodes(),
             edges: vec![],
             diagnostics: vec![],
+            spill_dir: None,
         },
         vec!["src/Bonus.php".into()],
         vec![],
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     s.search_page(

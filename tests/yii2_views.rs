@@ -504,7 +504,9 @@ echo $issetWager;
     ]);
     let paths: Vec<String> = g.nodes.iter().map(|n| n.span.path.clone()).collect();
     let mut service = AtlasService::new(Box::new(MemoryRepository::new()));
-    service.index(g, paths, vec![]).unwrap();
+    service
+        .index(g, paths, vec![], &std::collections::BTreeMap::new())
+        .unwrap();
     let view = "view:partner/views/my-bonus/index.php";
     let outline = service
         .outline_with_usage(

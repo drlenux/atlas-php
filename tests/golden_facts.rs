@@ -19,7 +19,7 @@ fn index_php(source: &str, path: &str) -> AtlasService {
         )
         .unwrap();
     let mut s = AtlasService::new(Box::new(MemoryRepository::new()));
-    s.index(snapshot, vec![path.into()], vec![]).unwrap();
+    s.index(snapshot, vec![path.into()], vec![], &std::collections::BTreeMap::new()).unwrap();
     s
 }
 

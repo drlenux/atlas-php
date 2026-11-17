@@ -147,8 +147,8 @@ fn spawn_watcher(
     let progress = panic_guard::lock(&service).indexing_progress();
     // The observer scans files independently of builds, so pending changes are
     // reported while a build runs; the builder consumes its latest scan.
-    let latest: Arc<Mutex<Option<BTreeMap<String, u64>>>> = Arc::default();
-    let published: Arc<Mutex<Option<BTreeMap<String, u64>>>> = Arc::default();
+    let latest: Arc<Mutex<Option<BTreeMap<String, String>>>> = Arc::default();
+    let published: Arc<Mutex<Option<BTreeMap<String, String>>>> = Arc::default();
     spawn_observer(
         config.clone(),
         stop.clone(),
@@ -161,6 +161,19 @@ fn spawn_watcher(
             .with_log(log)
             .with_progress(progress.clone());
         let mut debounce = Debouncer::new(config.debounce_ms);
+        // Restore path→MD5 baseline from PostgreSQL so unchanged files are skipped.
+        {
+            let mut service = panic_guard::lock(&service);
+            if coordinator
+                .restore_from(&mut service)
+                .unwrap_or(false)
+            {
+                if let Some(files) = coordinator.published_files().cloned() {
+                    debounce.seed(files.clone());
+                    *panic_guard::lock(&published) = Some(files);
+                }
+            }
+        }
         let started = Instant::now();
         while !stop.load(Ordering::Relaxed) {
             // A panic in analysis or publication fails this pass; the watcher thread survives.
@@ -222,8 +235,8 @@ fn spawn_observer(
     config: Config,
     stop: Arc<AtomicBool>,
     progress: code_atlas::progress::IndexingProgress,
-    latest: Arc<Mutex<Option<BTreeMap<String, u64>>>>,
-    published: Arc<Mutex<Option<BTreeMap<String, u64>>>>,
+    latest: Arc<Mutex<Option<BTreeMap<String, String>>>>,
+    published: Arc<Mutex<Option<BTreeMap<String, String>>>>,
 ) {
     thread::spawn(move || {
         while !stop.load(Ordering::Relaxed) {

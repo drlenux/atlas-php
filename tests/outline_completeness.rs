@@ -40,9 +40,11 @@ fn service() -> AtlasService {
                 revision: 0,
             }],
             diagnostics: vec![],
+            spill_dir: None,
         },
         vec!["src/A.php".into()],
         vec![],
+        &std::collections::BTreeMap::new(),
     )
     .unwrap();
     s

@@ -7,7 +7,10 @@ use super::{
 };
 use crate::domain::Node;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 #[derive(Clone)]
 struct Binding {
@@ -58,7 +61,7 @@ fn analyze_with(
     inherited: Env,
     annotated_vars: BTreeMap<String, String>,
 ) -> Result<(), String> {
-    let unit = project.units[function.unit].clone();
+    let unit = Arc::clone(&project.units[function.unit]);
     // Start after the token that opens the body (`{`), so a leading `@var` counts.
     // File-scope bodies start at token 0 (no `{`): begin at the first comment so
     // leading view `@var` annotations are not skipped.
@@ -149,7 +152,7 @@ fn analyze_with(
 struct Scope<'a, 'b> {
     project: &'a mut FlowHost<'b>,
     function: &'a Function,
-    unit: Unit,
+    unit: Arc<Unit>,
     occurrences: BTreeMap<String, usize>,
     /// `/** @var Type $name */` seen so far in the body (fallback types).
     annotated_vars: BTreeMap<String, String>,
@@ -287,7 +290,7 @@ impl Scope<'_, '_> {
                     let expr = expression::parse(&self.unit, next + 2, close)?;
                     let mut branch_env = env.clone();
                     self.walk(&expr, &mut branch_env, &current)?;
-                    let (a, b, after) = self.body(close + 1, end)?;
+                    let (a, b, after) = self.body(close + 1, end, &["elseif", "else", "endif"])?;
                     let mut branch_conditions =
                         current.iter().chain(&negative).cloned().collect::<Vec<_>>();
                     branch_conditions.push(condition.clone());
@@ -312,7 +315,7 @@ impl Scope<'_, '_> {
                 let mut else_conditions =
                     current.iter().chain(&negative).cloned().collect::<Vec<_>>();
                 if self.unit.is(next, "else") {
-                    let (a, b, after) = self.body(next + 1, end)?;
+                    let (a, b, after) = self.body(next + 1, end, &["endif"])?;
                     self.ensure_branch("else", next, after, "", &else_conditions)?;
                     if !self.block(a, b, &mut else_env, &mut else_conditions, depth + 1)? {
                         remaining.push((else_env, else_conditions));
@@ -359,7 +362,14 @@ impl Scope<'_, '_> {
                     return Err(format!("{keyword} requires parentheses"));
                 }
                 let close = self.unit.pairs[i + 1].unwrap();
-                let (a, b, next) = self.body(close + 1, end)?;
+                let alt_end = match keyword.as_str() {
+                    "foreach" => "endforeach",
+                    "while" => "endwhile",
+                    "for" => "endfor",
+                    "switch" => "endswitch",
+                    _ => "endif",
+                };
+                let (a, b, next) = self.body(close + 1, end, &[alt_end])?;
                 let mut loop_env = env.clone();
                 let mut loop_conditions = current.clone();
                 loop_conditions.push(format!("{keyword} ({})", self.unit.text(i + 2, close)));
@@ -416,7 +426,7 @@ impl Scope<'_, '_> {
             }
             if self.unit.is(i, "try") || self.unit.is(i, "finally") || self.unit.is(i, "do") {
                 let kind = self.unit.tokens[i].text.clone();
-                let (a, b, next) = self.body(i + 1, end)?;
+                let (a, b, next) = self.body(i + 1, end, &[])?;
                 let mut nested_env = env.clone();
                 let mut nested_conditions = current.clone();
                 nested_conditions.push(kind.clone());
@@ -433,7 +443,7 @@ impl Scope<'_, '_> {
                     return Err("catch requires parentheses".into());
                 }
                 let close = self.unit.pairs[i + 1].unwrap();
-                let (a, b, next) = self.body(close + 1, end)?;
+                let (a, b, next) = self.body(close + 1, end, &[])?;
                 let mut catch_env = env.clone();
                 for token in i + 2..close {
                     if self.unit.tokens[token].kind == TokenKind::Variable {
@@ -463,6 +473,28 @@ impl Scope<'_, '_> {
                 self.block(a, b, &mut catch_env, &mut nested, depth + 1)?;
                 *env = merge([&*env, &catch_env]);
                 i = next;
+                continue;
+            }
+            if ["require", "require_once", "include", "include_once"]
+                .iter()
+                .any(|v| self.unit.is(i, v))
+            {
+                let stop = self.unit.end_statement(i + 1, end);
+                let (expr_end, advance) = if stop < end {
+                    (stop, stop + 1)
+                } else if i + 1 < end && expression::parse(&self.unit, i + 1, end).is_ok() {
+                    (end, end)
+                } else {
+                    return Err(format!(
+                        "statement is missing semicolon at line {}",
+                        self.unit.tokens[i].line
+                    ));
+                };
+                if i + 1 < expr_end {
+                    let expr = expression::parse(&self.unit, i + 1, expr_end)?;
+                    self.walk(&expr, env, &current)?;
+                }
+                i = advance;
                 continue;
             }
             if self.unit.is(i, "{") {
@@ -573,12 +605,19 @@ impl Scope<'_, '_> {
         }
         "exit"
     }
-    fn body(&self, start: usize, end: usize) -> Result<(usize, usize, usize), String> {
+    /// Statement body after `if (…)` / `foreach (…)` / `else` / `try` / …
+    /// `alt_ends` — colon-syntax terminators (`endif`, `elseif`, `endforeach`, …).
+    fn body(
+        &self,
+        start: usize,
+        end: usize,
+        alt_ends: &[&str],
+    ) -> Result<(usize, usize, usize), String> {
         if self.unit.is(start, "{") {
             let close = self.unit.pairs[start].ok_or("unclosed statement block")?;
             Ok((start + 1, close, close + 1))
         } else if self.unit.is(start, ":") {
-            Err("alternative PHP control-flow syntax is unsupported".into())
+            self.alternative_body(start, end, alt_ends)
         } else {
             let stop = self.unit.end_statement(start, end);
             if stop == end {
@@ -586,6 +625,82 @@ impl Scope<'_, '_> {
             }
             Ok((start, stop + 1, stop + 1))
         }
+    }
+
+    /// `if (): … endif` / `foreach (): … endforeach` with nesting; `elseif`/`else`
+    /// end an if-arm without being consumed when listed in `alt_ends`.
+    fn alternative_body(
+        &self,
+        start: usize,
+        end: usize,
+        alt_ends: &[&str],
+    ) -> Result<(usize, usize, usize), String> {
+        if alt_ends.is_empty() {
+            return Err("alternative PHP control-flow syntax is unsupported".into());
+        }
+        let mut depth = 1usize;
+        let mut i = start + 1;
+        while i < end {
+            if let Some(after) = self.alt_nested_opener(i, end) {
+                depth += 1;
+                i = after;
+                continue;
+            }
+            let text = self.unit.tokens[i].text.to_ascii_lowercase();
+            if depth == 1 && alt_ends.iter().any(|e| *e == text) {
+                if text.starts_with("end") {
+                    let after = if self.unit.is(i + 1, ";") {
+                        i + 2
+                    } else {
+                        i + 1
+                    };
+                    return Ok((start + 1, i, after));
+                }
+                return Ok((start + 1, i, i));
+            }
+            if matches!(
+                text.as_str(),
+                "endif" | "endforeach" | "endwhile" | "endfor" | "endswitch"
+            ) {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let after = if self.unit.is(i + 1, ";") {
+                        i + 2
+                    } else {
+                        i + 1
+                    };
+                    return Ok((start + 1, i, after));
+                }
+                i += 1;
+                continue;
+            }
+            if let Some(close) = self.unit.pairs[i] {
+                if close > i {
+                    i = close + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        Err("unclosed alternative control-flow block".into())
+    }
+
+    /// Nested `if (`…`):` / `foreach (`…`):` / … — returns index after the `:`.
+    fn alt_nested_opener(&self, i: usize, end: usize) -> Option<usize> {
+        if !["if", "while", "for", "foreach", "switch"]
+            .iter()
+            .any(|k| self.unit.is(i, k))
+        {
+            return None;
+        }
+        if !self.unit.is(i + 1, "(") {
+            return None;
+        }
+        let close = self.unit.pairs[i + 1]?;
+        if close + 1 < end && self.unit.is(close + 1, ":") {
+            return Some(close + 2);
+        }
+        None
     }
     fn walk(&mut self, expr: &Expr, env: &mut Env, conditions: &[String]) -> Result<(), String> {
         self.walk_expr(expr, env, conditions, true)
@@ -2335,13 +2450,16 @@ impl Scope<'_, '_> {
     }
     fn emit_commented_site(&mut self, comment: &tokens::Comment) -> Result<(), String> {
         let text = comment.text.trim().trim_end_matches(';').trim();
-        let site_kind = if text.contains("->") || text.contains("::") {
-            "call_site"
-        } else if text.to_ascii_lowercase().starts_with("return") {
-            "return_site"
-        } else {
-            return Ok(());
-        };
+        let lower = text.to_ascii_lowercase();
+        // Member calls, free-function calls (`memory_get_usage()`), and returns.
+        let site_kind =
+            if text.contains("->") || text.contains("::") || free_function_call_comment(text) {
+                "call_site"
+            } else if lower.starts_with("return") {
+                "return_site"
+            } else {
+                return Ok(());
+            };
         let line = comment.line.to_string();
         let fp = tokens::fingerprint([comment.text.as_str(), line.as_str()]);
         let id = format!("{site_kind}:{}:comment:{fp}", self.function.id);
@@ -2640,14 +2758,23 @@ impl Scope<'_, '_> {
                     }
                 } else if receiver.is_none() {
                     Typed::code(match member.to_ascii_lowercase().as_str() {
-                        "fopen" | "tmpfile" | "popen" | "fsockopen" => "resource|false",
-                        "strlen" | "count" | "intval" | "ord" => "int",
-                        "strval" | "sprintf" | "trim" | "strtolower" | "strtoupper" | "substr" => {
-                            "string"
+                        "fopen" | "tmpfile" | "popen" | "fsockopen" | "proc_open" => {
+                            "resource|false"
                         }
+                        "strlen"
+                        | "count"
+                        | "intval"
+                        | "ord"
+                        | "memory_get_usage"
+                        | "memory_get_peak_usage"
+                        | "gc_collect_cycles" => "int",
+                        "strval" | "sprintf" | "trim" | "strtolower" | "strtoupper" | "substr"
+                        | "shell_exec" | "exec" | "passthru" | "sys_get_temp_dir" => "string",
                         "is_int" | "is_string" | "is_null" | "is_array" | "isset" | "empty"
-                        | "is_resource" => "bool",
-                        "explode" | "array_keys" | "array_values" => "array",
+                        | "is_resource" | "gc_enabled" => "bool",
+                        "explode" | "array_keys" | "array_values" | "opcache_get_status"
+                        | "get_defined_vars" => "array",
+                        "gc_disable" | "gc_enable" | "proc_close" => "null",
                         _ => "unknown",
                     })
                 } else {
@@ -3215,9 +3342,41 @@ fn comment_signal(text: &str) -> bool {
     text.contains('$')
         || text.contains("->")
         || text.contains("::")
+        || free_function_call_comment(text)
         || lower.contains("function")
         || lower.contains("class")
         || lower.contains("return")
+}
+
+/// `memory_get_usage()`, `$end = memory_get_usage()`, `gc_collect_cycles()` in comments.
+fn free_function_call_comment(text: &str) -> bool {
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            let mut end = i + c.len_utf8();
+            while let Some(&(j, d)) = chars.peek() {
+                if d.is_ascii_alphanumeric() || d == '_' {
+                    end = j + d.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let _ = end;
+            while matches!(chars.peek(), Some(&(_, d)) if d.is_whitespace()) {
+                chars.next();
+            }
+            if matches!(chars.peek(), Some(&(_, '('))) {
+                let before = &text[..start];
+                if before.ends_with("->") || before.ends_with("?->") || before.ends_with("::") {
+                    continue;
+                }
+                return true;
+            }
+        }
+    }
+    false
 }
 fn union<'a>(types: impl IntoIterator<Item = &'a str>) -> String {
     let mut parts = Vec::new();

@@ -36,7 +36,7 @@ fn service() -> AtlasService {
     }))
     .unwrap();
     let mut s = AtlasService::new(Box::new(MemoryRepository::new()));
-    s.index(snapshot, vec!["UserBonus.php".into()], vec![])
+    s.index(snapshot, vec!["UserBonus.php".into()], vec![], &std::collections::BTreeMap::new())
         .unwrap();
     s
 }

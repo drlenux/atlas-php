@@ -58,8 +58,18 @@ pub fn lex(source: &str, options: &AnalysisOptions) -> Result<(Vec<Token>, Vec<C
                 continue;
             }
             if source[at..].starts_with("<?=") {
+                // Short echo is `echo <expr>`; emit `echo` so flow walks the call/expr.
+                let tag_start = at;
                 at += 3;
                 php = true;
+                out.push(Token {
+                    text: "echo".into(),
+                    start: tag_start,
+                    end: tag_start + 3,
+                    line,
+                    end_line: line,
+                    kind: TokenKind::Ident,
+                });
                 continue;
             }
             if bytes[at] == b'\n' {
@@ -69,8 +79,19 @@ pub fn lex(source: &str, options: &AnalysisOptions) -> Result<(Vec<Token>, Vec<C
             continue;
         }
         if source[at..].starts_with("?>") {
+            // PHP inserts a semicolon before leaving PHP mode — keeps view islands
+            // (`<?= … ?>…<?= … ?>`) from gluing into one expression.
+            let tag_start = at;
             at += 2;
             php = false;
+            out.push(Token {
+                text: ";".into(),
+                start: tag_start,
+                end: tag_start + 2,
+                line,
+                end_line: line,
+                kind: TokenKind::Symbol,
+            });
             continue;
         }
         if bytes[at].is_ascii_whitespace() {

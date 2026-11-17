@@ -82,6 +82,7 @@ impl PostgresRepository {
         for migration in [
             include_str!("../migrations/001_atlas.sql"),
             include_str!("../migrations/002_atlas_meta.sql"),
+            include_str!("../migrations/003_atlas_source_files.sql"),
         ] {
             if let Err(error) = self.execute_static(migration) {
                 let _ = self.execute_static("ROLLBACK");
@@ -448,6 +449,46 @@ impl Repository for PostgresRepository {
         )?;
         Ok(())
     }
+    fn source_files(&mut self) -> Result<std::collections::BTreeMap<String, String>> {
+        let rows = self.query("SELECT path, content_hash FROM atlas_source_files", &[])?;
+        let mut out = std::collections::BTreeMap::new();
+        for row in rows {
+            let mut cols = row.into_iter();
+            if let (Some(Some(path)), Some(Some(hash))) = (cols.next(), cols.next()) {
+                out.insert(path, hash);
+            }
+        }
+        Ok(out)
+    }
+    fn replace_source_files(
+        &mut self,
+        files: &std::collections::BTreeMap<String, String>,
+    ) -> Result<()> {
+        self.execute_static("DELETE FROM atlas_source_files")?;
+        for (path, hash) in files {
+            self.query(
+                "INSERT INTO atlas_source_files(path, content_hash) VALUES ($1,$2)",
+                &[path, hash],
+            )?;
+        }
+        Ok(())
+    }
+    fn upsert_source_files(
+        &mut self,
+        upsert: &std::collections::BTreeMap<String, String>,
+        remove: &[String],
+    ) -> Result<()> {
+        for path in remove {
+            self.query("DELETE FROM atlas_source_files WHERE path=$1", &[path])?;
+        }
+        for (path, hash) in upsert {
+            self.query(
+                "INSERT INTO atlas_source_files(path, content_hash) VALUES ($1,$2) ON CONFLICT(path) DO UPDATE SET content_hash=EXCLUDED.content_hash",
+                &[path, hash],
+            )?;
+        }
+        Ok(())
+    }
     fn existing_node_ids(
         &mut self,
         ids: &std::collections::BTreeSet<String>,
@@ -467,7 +508,7 @@ impl Repository for PostgresRepository {
     }
     fn reset(&mut self) -> Result<()> {
         self.execute_static(
-            "TRUNCATE atlas_edges, atlas_nodes, atlas_corrections, atlas_diagnostics, atlas_deliveries, atlas_meta",
+            "TRUNCATE atlas_edges, atlas_nodes, atlas_corrections, atlas_diagnostics, atlas_deliveries, atlas_meta, atlas_source_files",
         )
     }
     fn put_delivery(&mut self, d: &Delivery) -> Result<()> {

@@ -1,15 +1,18 @@
 use crate::config::Config;
+use md5::{Digest, Md5};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fs,
-    hash::{DefaultHasher, Hasher},
     io::Read,
     path::{Path, PathBuf},
 };
 
+/// path → MD5 hex of file contents (same as `atlas_source_files.content_hash`).
+pub type FileHashes = BTreeMap<String, String>;
+
 #[derive(Debug, Default)]
 pub struct Discovery {
-    pub files: BTreeMap<String, u64>,
+    pub files: FileHashes,
     pub diagnostics: Vec<String>,
 }
 
@@ -28,7 +31,7 @@ pub fn discover(config: &Config) -> Result<Discovery, String> {
         }
         let mut file =
             fs::File::open(&path).map_err(|error| format!("cannot read {relative}: {error}"))?;
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = Md5::new();
         let mut buffer = [0_u8; 16_384];
         let mut bytes = 0;
         loop {
@@ -40,9 +43,10 @@ pub fn discover(config: &Config) -> Result<Discovery, String> {
             if bytes > config.max_file_bytes {
                 return Err(format!("{relative}: file grew beyond size limit"));
             }
-            hasher.write(&buffer[..length]);
+            hasher.update(&buffer[..length]);
         }
-        scan.files.insert(relative, hasher.finish());
+        scan.files
+            .insert(relative, format!("{:x}", hasher.finalize()));
     }
     Ok(scan)
 }
@@ -254,10 +258,7 @@ fn wildcard(pattern: &[u8], value: &[u8]) -> bool {
 
 /// Files whose content differs from the published build, including new and removed
 /// files, in path order.
-pub fn pending_paths(
-    published: &BTreeMap<String, u64>,
-    current: &BTreeMap<String, u64>,
-) -> Vec<String> {
+pub fn pending_paths(published: &FileHashes, current: &FileHashes) -> Vec<String> {
     let mut paths: Vec<String> = current
         .iter()
         .filter(|(path, hash)| published.get(*path) != Some(hash))
@@ -275,7 +276,7 @@ pub fn pending_paths(
 
 pub struct Debouncer {
     delay_ms: u64,
-    observed: Option<BTreeMap<String, u64>>,
+    observed: Option<FileHashes>,
     changed_at: Option<u64>,
 }
 impl Debouncer {
@@ -286,6 +287,11 @@ impl Debouncer {
             changed_at: None,
         }
     }
+    /// Seed from a restored DB baseline so the first scan does not force a full rebuild.
+    pub fn seed(&mut self, files: FileHashes) {
+        self.observed = Some(files);
+        self.changed_at = None;
+    }
     /// A change was observed and is waiting for the debounce delay.
     pub fn pending(&self) -> bool {
         self.changed_at.is_some()
@@ -293,7 +299,7 @@ impl Debouncer {
     pub fn retry_after(&mut self, now_ms: u64) {
         self.changed_at = Some(now_ms);
     }
-    pub fn observe(&mut self, files: &BTreeMap<String, u64>, now_ms: u64) -> bool {
+    pub fn observe(&mut self, files: &FileHashes, now_ms: u64) -> bool {
         match &self.observed {
             None => {
                 self.observed = Some(files.clone());

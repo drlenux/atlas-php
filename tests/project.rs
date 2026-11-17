@@ -76,9 +76,9 @@ fn content_change_is_detected_even_at_same_file_length() {
 
 #[test]
 fn debounce_uses_last_change_and_emits_initial_snapshot_once() {
-    let first = BTreeMap::from([("a.php".to_owned(), 1)]);
-    let second = BTreeMap::from([("a.php".to_owned(), 2)]);
-    let third = BTreeMap::from([("a.php".to_owned(), 3)]);
+    let first = BTreeMap::from([("a.php".to_owned(), "1".into())]);
+    let second = BTreeMap::from([("a.php".to_owned(), "2".into())]);
+    let third = BTreeMap::from([("a.php".to_owned(), "3".into())]);
     let mut debounce = Debouncer::new(1000);
     assert!(debounce.observe(&first, 0));
     assert!(!debounce.observe(&first, 10));
@@ -91,7 +91,7 @@ fn debounce_uses_last_change_and_emits_initial_snapshot_once() {
 
 #[test]
 fn failed_publication_retries_even_without_another_source_edit() {
-    let files = BTreeMap::from([("a.php".to_owned(), 1)]);
+    let files = BTreeMap::from([("a.php".to_owned(), "1".into())]);
     let mut debounce = Debouncer::new(1000);
     assert!(debounce.observe(&files, 0));
     debounce.retry_after(20);
@@ -126,10 +126,10 @@ fn declaration_paths_are_discovered_while_the_rest_of_vendor_stays_excluded() {
 #[test]
 fn debounce_reports_pending_changes_until_they_are_released() {
     let mut debounce = Debouncer::new(100);
-    let first = BTreeMap::from([("a.php".to_string(), 1_u64)]);
+    let first = BTreeMap::from([("a.php".to_string(), "1".into())]);
     assert!(debounce.observe(&first, 0));
     assert!(!debounce.pending());
-    let changed = BTreeMap::from([("a.php".to_string(), 2_u64)]);
+    let changed = BTreeMap::from([("a.php".to_string(), "2".into())]);
     assert!(!debounce.observe(&changed, 10));
     assert!(debounce.pending());
     assert!(debounce.observe(&changed, 200));
@@ -140,14 +140,14 @@ fn debounce_reports_pending_changes_until_they_are_released() {
 fn pending_paths_list_changed_new_and_removed_files_against_the_publication() {
     use code_atlas::project::pending_paths;
     let published = BTreeMap::from([
-        ("a.php".to_string(), 1_u64),
-        ("b.php".to_string(), 2),
-        ("gone.php".to_string(), 3),
+        ("a.php".to_string(), "1".into()),
+        ("b.php".to_string(), "2".into()),
+        ("gone.php".to_string(), "3".into()),
     ]);
     let current = BTreeMap::from([
-        ("a.php".to_string(), 1_u64),
-        ("b.php".to_string(), 20),
-        ("new.php".to_string(), 4),
+        ("a.php".to_string(), "1".into()),
+        ("b.php".to_string(), "20".into()),
+        ("new.php".to_string(), "4".into()),
     ]);
     assert_eq!(
         pending_paths(&published, &current),

@@ -187,7 +187,11 @@ impl PluginRegistry {
 /// Fold another language graph into `into`, keeping one node/edge per ID.
 /// Prefer a non-`external` declaration; among equals prefer a `.sql`/`.pgsql`
 /// path so DDL wins over an SQL-in-PHP stub even when PHP runs after pgsql.
-fn merge_language_graph(into: &mut GraphSnapshot, from: GraphSnapshot) {
+fn merge_language_graph(into: &mut GraphSnapshot, mut from: GraphSnapshot) {
+    // PHP may already have occurrence chunks on disk; keep the dir for publish.
+    if from.spill_dir.is_some() {
+        into.spill_dir = from.spill_dir.take().or(into.spill_dir.take());
+    }
     let mut nodes: BTreeMap<String, Node> =
         into.nodes.drain(..).map(|n| (n.id.clone(), n)).collect();
     for node in from.nodes {

@@ -13,7 +13,7 @@ fn analyze(root: &Path, files: &[&str]) -> GraphSnapshot {
         .iter()
         .map(|path| SourceFile {
             path: (*path).into(),
-            source: std::fs::read_to_string(root.join(path)).unwrap(),
+            source: std::fs::read_to_string(root.join(path)).unwrap().into(),
         })
         .collect::<Vec<_>>();
     PhpLanguagePlugin
@@ -41,6 +41,7 @@ fn actual_php_fixture_snapshot_is_accepted_and_context_preserves_candidates() {
             snapshot,
             files.iter().map(|s| s.to_string()).collect(),
             vec![],
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
     assert!(report.nodes > 20);
@@ -81,6 +82,7 @@ fn actual_class_rename_preserves_method_trust_and_metadata_references() {
             analyze(root.path(), &["Source.php"]),
             vec!["Source.php".into()],
             vec![],
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
     let id = "method:Identity\\Before::value";
@@ -107,6 +109,7 @@ fn actual_class_rename_preserves_method_trust_and_metadata_references() {
             analyze(root.path(), &["Source.php"]),
             vec!["Source.php".into()],
             vec![],
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
     let method = service.context(id, 0, 10).unwrap().nodes.remove(0);

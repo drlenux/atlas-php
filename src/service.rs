@@ -87,6 +87,37 @@ impl AtlasService {
         self.repository.source_paths()
     }
 
+    /// Published `path → MD5` baseline (survives process restart).
+    pub fn source_files(&mut self) -> Result<BTreeMap<String, String>> {
+        self.repository.source_files()
+    }
+
+    pub fn replace_source_files(&mut self, files: &BTreeMap<String, String>) -> Result<()> {
+        self.repository.replace_source_files(files)
+    }
+
+    /// Declaration nodes used to rebuild the incremental surface after a restart.
+    pub fn declaration_nodes(&mut self) -> Result<Vec<Node>> {
+        Ok(self
+            .repository
+            .nodes()?
+            .into_iter()
+            .filter(|n| {
+                matches!(
+                    n.kind.as_str(),
+                    "class"
+                        | "interface"
+                        | "trait"
+                        | "enum"
+                        | "method"
+                        | "function"
+                        | "property"
+                        | "constant"
+                ) && n.metadata["closure"] != true
+            })
+            .collect())
+    }
+
     /// Live text search over the watched source tree (MCP `atlas_grep`).
     pub fn grep_source(
         &mut self,
@@ -265,11 +296,13 @@ impl AtlasService {
         snapshot: GraphSnapshot,
         indexed_paths: Vec<String>,
         removed_paths: Vec<String>,
+        source_files: &BTreeMap<String, String>,
     ) -> Result<IndexReport> {
         let progress = self.progress.clone();
         progress.phase("publishing", "waiting_for_writer", None, "items");
         transactional(self.repository.as_mut(), |r| {
             let report = apply_snapshot(r, snapshot, indexed_paths, removed_paths, &progress)?;
+            r.replace_source_files(source_files)?;
             r.set_meta(INDEXED_AT, &now().to_string())?;
             progress.phase("publishing", "commit", None, "items");
             Ok(report)
@@ -283,6 +316,7 @@ impl AtlasService {
         diagnostics: Vec<Diagnostic>,
         indexed_paths: Vec<String>,
         removed_paths: Vec<String>,
+        source_files: &BTreeMap<String, String>,
     ) -> Result<IndexReport> {
         let progress = self.progress.clone();
         progress.phase("publishing", "waiting_for_writer", None, "items");
@@ -295,9 +329,22 @@ impl AtlasService {
                 removed_paths,
                 &progress,
             )?;
+            r.replace_source_files(source_files)?;
             r.set_meta(INDEXED_AT, &now().to_string())?;
             progress.phase("publishing", "commit", None, "items");
             Ok(report)
+        })
+    }
+
+    /// Persist hashes only (unchanged tree after restart — no graph rewrite).
+    pub fn touch_source_baseline(
+        &mut self,
+        source_files: &BTreeMap<String, String>,
+    ) -> Result<IndexReport> {
+        transactional(self.repository.as_mut(), |r| {
+            r.replace_source_files(source_files)?;
+            r.set_meta(INDEXED_AT, &now().to_string())?;
+            Ok(IndexReport::default())
         })
     }
 

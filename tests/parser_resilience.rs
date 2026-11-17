@@ -25,7 +25,7 @@ fn partial_edits_and_unicode_never_panic_or_leave_dangling_graph_edges() {
             PhpLanguagePlugin.analyze(
                 &[SourceFile {
                     path: "partial.php".into(),
-                    source: source.clone(),
+                    source: source.clone().into(),
                 }],
                 &AnalysisOptions::default(),
             )

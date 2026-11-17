@@ -134,9 +134,11 @@ fn wallet() -> AtlasService {
                 nodes,
                 edges,
                 diagnostics: vec![],
-            },
+                spill_dir: None,
+        },
             vec![PATH.into()],
             vec![],
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
     service

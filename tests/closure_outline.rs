@@ -52,7 +52,7 @@ fn outline_lists_calls_inside_nested_closure() {
         .into_iter()
         .collect();
     let mut service = AtlasService::new(Box::new(MemoryRepository::new()));
-    service.index(g, paths, vec![]).expect("index");
+    service.index(g, paths, vec![], &std::collections::BTreeMap::new()).expect("index");
     let outline = service
         .outline("method:App\\Host::activate")
         .expect("outline");

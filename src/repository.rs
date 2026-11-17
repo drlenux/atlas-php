@@ -24,6 +24,24 @@ pub trait Repository: Send {
     fn put_delivery(&mut self, delivery: &Delivery) -> Result<()>;
     fn meta(&mut self, key: &str) -> Result<Option<String>>;
     fn set_meta(&mut self, key: &str, value: &str) -> Result<()>;
+    /// Last published `path → MD5 hex` (empty when never indexed).
+    fn source_files(&mut self) -> Result<BTreeMap<String, String>> {
+        Ok(BTreeMap::new())
+    }
+    /// Replace the published source-file baseline (full index).
+    fn replace_source_files(&mut self, files: &BTreeMap<String, String>) -> Result<()> {
+        let _ = files;
+        Ok(())
+    }
+    /// Upsert hashes for republished paths and drop removed ones (incremental).
+    fn upsert_source_files(
+        &mut self,
+        upsert: &BTreeMap<String, String>,
+        remove: &[String],
+    ) -> Result<()> {
+        let _ = (upsert, remove);
+        Ok(())
+    }
     /// Removes every stored atlas fact: graph, diagnostics, corrections, deliveries, meta.
     fn reset(&mut self) -> Result<()>;
     /// Which of `ids` are stored nodes (one round trip for a partial publication).
@@ -452,6 +470,7 @@ struct MemoryState {
     diagnostics: Vec<Diagnostic>,
     deliveries: BTreeMap<String, Delivery>,
     meta: BTreeMap<String, String>,
+    source_files: BTreeMap<String, String>,
 }
 
 #[derive(Default)]
@@ -548,6 +567,26 @@ impl Repository for MemoryRepository {
     }
     fn set_meta(&mut self, key: &str, value: &str) -> Result<()> {
         self.state.meta.insert(key.into(), value.into());
+        Ok(())
+    }
+    fn source_files(&mut self) -> Result<BTreeMap<String, String>> {
+        Ok(self.state.source_files.clone())
+    }
+    fn replace_source_files(&mut self, files: &BTreeMap<String, String>) -> Result<()> {
+        self.state.source_files = files.clone();
+        Ok(())
+    }
+    fn upsert_source_files(
+        &mut self,
+        upsert: &BTreeMap<String, String>,
+        remove: &[String],
+    ) -> Result<()> {
+        for path in remove {
+            self.state.source_files.remove(path);
+        }
+        for (path, hash) in upsert {
+            self.state.source_files.insert(path.clone(), hash.clone());
+        }
         Ok(())
     }
     fn reset(&mut self) -> Result<()> {

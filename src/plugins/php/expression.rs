@@ -158,6 +158,17 @@ fn parse_depth(u: &Unit, start: usize, end: usize, depth: usize) -> Result<Expr,
     while next < end {
         if u.is(next, "(") {
             let close = u.pairs[next].ok_or("unclosed call")?;
+            // PHP 8.1 first-class callable: `time(...)`, `$this->m(...)`, self::isSource(...)
+            // — value referring to the callable, not an invocation.
+            if next + 2 == close && u.is(next + 1, "...") {
+                expr = Expr {
+                    start,
+                    end: close + 1,
+                    kind: expr.kind,
+                };
+                next = close + 1;
+                continue;
+            }
             let args = arguments(u, next + 1, close, depth + 1)?;
             // `foo()`, `$fn()`, or `($this->credit)()` — property/callable invoke
             // keeps the callee as receiver with member `__invoke`.
@@ -224,19 +235,35 @@ fn parse_depth(u: &Unit, start: usize, end: usize, depth: usize) -> Result<Expr,
             };
             if u.is(after, "(") {
                 let close = u.pairs[after].unwrap();
-                let args = arguments(u, after + 1, close, depth + 1)?;
-                expr = Expr {
-                    start,
-                    end: close + 1,
-                    kind: Kind::Call {
-                        receiver: Some(Box::new(expr)),
-                        member,
-                        dynamic,
-                        static_,
-                        args,
-                    },
-                };
-                next = close + 1;
+                // `$this->m(...)` / `self::m(...)` first-class callable — keep as Property.
+                if after + 2 == close && u.is(after + 1, "...") {
+                    expr = Expr {
+                        start,
+                        end: close + 1,
+                        kind: Kind::Property {
+                            receiver: Box::new(expr),
+                            member,
+                            dynamic,
+                            static_,
+                            nullsafe,
+                        },
+                    };
+                    next = close + 1;
+                } else {
+                    let args = arguments(u, after + 1, close, depth + 1)?;
+                    expr = Expr {
+                        start,
+                        end: close + 1,
+                        kind: Kind::Call {
+                            receiver: Some(Box::new(expr)),
+                            member,
+                            dynamic,
+                            static_,
+                            args,
+                        },
+                    };
+                    next = close + 1;
+                }
             } else {
                 expr = Expr {
                     start,
@@ -575,38 +602,54 @@ fn parse_match(u: &Unit, start: usize, end: usize, depth: usize) -> Result<Expr,
         return Err("match body exceeds expression span".into());
     }
     let mut arms = Vec::new();
-    for (a, b) in u.split(close_paren + 2, close_brace, ",") {
+    // Multi-pattern arms (`1, 2 => $x`) contain commas before `=>`; merge split
+    // segments until the arm has an arrow (pairs already protect commas in values).
+    let parts = u.split(close_paren + 2, close_brace, ",");
+    let mut i = 0;
+    while i < parts.len() {
+        let (a, mut b) = parts[i];
         if a >= b {
+            i += 1;
             continue;
         }
-        let mut arrow = None;
-        let mut i = a;
-        while i < b {
-            if u.is(i, "=>") {
-                arrow = Some(i);
-                break;
-            }
-            if let Some(close) = u.pairs[i] {
-                if close > i {
-                    i = close + 1;
-                    continue;
-                }
+        let arrow = loop {
+            if let Some(arrow) = match_arm_arrow(u, a, b) {
+                break arrow;
             }
             i += 1;
-        }
-        let Some(arrow) = arrow else {
-            return Err("match arm requires =>".into());
+            if i >= parts.len() {
+                return Err("match arm requires =>".into());
+            }
+            b = parts[i].1;
         };
         if arrow + 1 >= b {
             return Err("missing match arm value".into());
         }
         arms.push(parse_depth(u, arrow + 1, b, depth + 1)?);
+        i += 1;
     }
     Ok(Expr {
         start,
         end: close_brace + 1,
         kind: Kind::Match { subject, arms },
     })
+}
+
+fn match_arm_arrow(u: &Unit, start: usize, end: usize) -> Option<usize> {
+    let mut i = start;
+    while i < end {
+        if u.is(i, "=>") {
+            return Some(i);
+        }
+        if let Some(close) = u.pairs[i] {
+            if close > i {
+                i = close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn array_items(u: &Unit, start: usize, end: usize, depth: usize) -> Result<Vec<ArrayItem>, String> {
